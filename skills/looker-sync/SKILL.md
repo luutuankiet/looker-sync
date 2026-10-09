@@ -1,21 +1,23 @@
 ---
 name: looker-sync
-description: Move LookML between a local folder and your own Looker dev workspace with scripts/looker_sync.py (pull, status, push with byte-for-byte read-back and validation, switch). Use before editing any LookML that must reach Looker, before validating a Looker project, when mounting a Looker project into a new folder, and when Looker and the local files might disagree.
+description: Move LookML between a local folder and your own Looker dev workspace with the looker-sync CLI (pull, status, push with byte-for-byte read-back and validation, switch). Use before editing any LookML that must reach Looker, before validating a Looker project, when mounting a Looker project into a new folder, and when Looker and the local files might disagree.
 ---
 
 # looker-sync
 
-`scripts/looker_sync.py` is the only path from local LookML to Looker. It talks to the
-Looker API with your own key, standard library only, nothing to install. It never commits,
-deploys, resets or creates branches: those stay clicks in the Looker IDE.
+`looker-sync` is the only path from local LookML to Looker. It talks to the Looker API with
+your own key. It never commits, deploys, resets or creates branches: Looker's API has no
+commit or push endpoint, so committing stays with git, and the rest stay clicks in the Looker
+IDE. Agents cannot commit LookML through this tool.
 
 ```
-python3 scripts/looker_sync.py -C <project folder> [--env-file <path>] <command>
+uvx looker-sync [-C <project folder>] [--env-file <path>] <command>
 ```
 
 `-C` defaults to the current folder. The env file holds `LOOKER_URL`, `LOOKER_CLIENT_ID`
-and `LOOKER_CLIENT_SECRET`; pass its path and let the tool read it. Never open it yourself.
-After `init` the path is remembered in the folder's `.looker-sync/config.json`.
+and `LOOKER_CLIENT_SECRET`. It is found as `--env-file`, then `LOOKER_SYNC_ENV`, then the
+`env_file` in `.looker-sync/config.json`, then `.env` in the project folder. Never open it
+yourself. `looker-sync --help` is the short reference; `looker-sync skill` prints this guide.
 
 ## The loop
 
@@ -67,18 +69,33 @@ to that user's dev workspace, which the developer never sees.
 - The Looker MCP write tools are not an alternative: they run in production mode under a
   separate login and cannot see dev files. MCP read and query tools are fine.
 
-## Mounting a project
+## Mounting a project, including from a blank folder
 
 ```
-python3 scripts/looker_sync.py -C <empty folder> --env-file <env> init --project <name> [--branch <b>]
+mkdir my-project && cd my-project
+uvx looker-sync init --project <name> [--branch <b>]
 ```
+
+In a folder with no credentials, `init` writes a `.env` template (owner-only permissions),
+adds `.env` and `.looker-sync/` to `.gitignore`, and exits with code 2 telling you what to
+fill in. The user fills `LOOKER_URL`, `LOOKER_CLIENT_ID` and `LOOKER_CLIENT_SECRET`; run the
+same `init` command again and it writes `.looker-sync/config.json` and pulls. It never
+overwrites a filled `.env` or an existing config. On a terminal it asks for the project and
+whether to pull; `--no-pull` writes metadata only.
 
 `init` refuses if the Looker dev workspace is on a different branch than `--branch` (it
 never switches), and its first pull refuses to overwrite local files that differ from
-Looker. Mount into an empty folder and compare by hand when in doubt: a folder kept by another
-sync tool can be stale.
+Looker (`--force` takes Looker's copy). Mount into an empty folder and compare by hand when
+in doubt: a folder kept by another sync tool can be stale.
+
+## Committing
+
+`looker-sync` does not commit. `status` prints how many commits the dev branch is ahead of
+and behind its remote; commit and push with git from the Looker IDE or a clone of the
+remote. Looker has no commit or push endpoint in its API, and the official Looker VS Code
+extension (1.0.0) does not use one either: it commits through local git.
 
 ## Tests
 
-`python3 -m unittest discover -s scripts -p 'test_looker_sync.py'` runs the CLI against a
-fake Looker. Run it after any change to the tool.
+From a source checkout, `python3 -m unittest discover -s scripts -p 'test_looker_sync.py'`
+runs the CLI against a fake Looker. Run it after any change to the tool.

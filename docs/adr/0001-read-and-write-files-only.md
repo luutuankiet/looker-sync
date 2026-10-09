@@ -1,6 +1,6 @@
 # The tool writes files and never touches git state
 
-`looker_sync.py` pulls, pushes, validates and checks out an existing branch by name. It
+`looker-sync` pulls, pushes, validates and checks out an existing branch by name. It
 never commits, deploys, resets or creates a branch, and it never sends `ref` to the branch
 endpoint, because `ref` triggers a hard reset that Looker force-pushes. Those actions stay
 clicks in the Looker IDE.

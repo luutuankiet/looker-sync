@@ -2,12 +2,13 @@
 
 A standard-library Python CLI that moves LookML between a local folder and your own Looker
 dev workspace: `pull`, `status`, `push` (byte-for-byte read-back, then validation) and
-`switch`. It never commits, deploys, resets or creates branches. Usage is in
-[README.md](README.md) and the `looker-sync` skill.
+`switch`. It never commits, deploys, resets or creates branches (Looker's API has no commit
+or push endpoint, so agents cannot commit). Published to PyPI: `uvx looker-sync`. Usage is in
+[README.md](README.md) and `skills/looker-sync/SKILL.md`, which `looker-sync skill` prints.
 
 ## Hard constraints
 
-- **Standard library only.** No dependencies, no install step.
+- **Standard library only.** No runtime dependencies.
 - **Never write in prod mode, never delete without `--delete`, never send `ref` to the
   branch endpoint** (it hard-resets and force-pushes).
 - **Credentials come only from the env file** (`LOOKER_URL`, `LOOKER_CLIENT_ID`,
@@ -17,8 +18,11 @@ dev workspace: `pull`, `status`, `push` (byte-for-byte read-back, then validatio
 ## Layout
 
 ```
-scripts/looker_sync.py        the CLI
+src/looker_sync/cli.py        the CLI (entry point `looker-sync`)
+skills/looker-sync/SKILL.md   the one authoritative guide: plugin skill, bundled in the wheel
+scripts/looker_sync.py        runs the CLI from a checkout
 scripts/test_looker_sync.py   tests against a fake Looker (subprocess, no network)
+releases/vX.Y.Z.md            release notes; a `v*.*.*` tag publishes via .github/workflows/release.yml
 scripts/gen-docs-index.sh     regenerates the docs index
 docs/                         architecture, traps, reference, adr; indexed in docs/README.md
 tmp/YYYYMMDD/<topic>/         scratch and evidence, gitignored

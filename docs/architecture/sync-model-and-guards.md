@@ -6,7 +6,7 @@ verified: 2026-10-09
 
 # Sync model and guards
 
-Everything is in `scripts/looker_sync.py`; tests are in `scripts/test_looker_sync.py` and
+Everything is in `src/looker_sync/cli.py`; tests are in `scripts/test_looker_sync.py` and
 run the CLI as a subprocess against a fake Looker.
 
 - **State.** `.looker-sync/state.json` holds the SHA-256 of each file's Looker content at the

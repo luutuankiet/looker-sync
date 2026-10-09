@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "looker-sync"
+version = "0.1.0"
+description = "Pull and push LookML between a local folder and your own Looker dev workspace, with read-back verification."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "luutuankiet" }]
+keywords = ["looker", "lookml", "sync", "cli"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/luutuankiet/looker-sync"
+Issues = "https://github.com/luutuankiet/looker-sync/issues"
+
+[project.scripts]
+looker-sync = "looker_sync.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/looker_sync"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills/looker-sync" = "looker_sync/_skills_data/looker-sync"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "skills", "README.md", "LICENSE", "pyproject.toml"]

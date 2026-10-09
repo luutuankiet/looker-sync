@@ -212,6 +212,56 @@ class CLITest(unittest.TestCase):
         return [e for e in self.fake.log if e[0] in ('POST', 'PUT', 'DELETE') and '/files' in e[1]
                 or e[1].endswith('/git_branch') and e[0] == 'PUT']
 
+    # ---- blank folder, skill, help
+
+    def test_init_in_blank_folder_writes_template_then_resumes(self):
+        with open(os.path.join(self.dir, '.env')) as f:
+            url = f.readline().split('=', 1)[1].strip()
+        blank = os.path.join(self.tmp.name, 'blank')
+        os.makedirs(blank)
+
+        def run(*a):
+            r = subprocess.run([sys.executable, CLI, '-C', blank, *a], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=60)
+            self.assertNotIn(SECRET, r.stdout + r.stderr)
+            return r
+        r = run('init', '--project', PROJECT)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        env = os.path.join(blank, '.env')
+        self.assertEqual(os.stat(env).st_mode & 0o777, 0o600)
+        with open(os.path.join(blank, '.gitignore')) as f:
+            ignored = f.read().split()
+        self.assertIn('.env', ignored)
+        self.assertIn('.looker-sync/', ignored)
+        self.assertFalse(os.path.exists(os.path.join(blank, '.looker-sync', 'config.json')))
+        with open(env, 'w') as f:
+            f.write(f'LOOKER_URL={url}\nLOOKER_CLIENT_ID=id\nLOOKER_CLIENT_SECRET={SECRET}\n')
+        r = run('init', '--project', PROJECT, '--branch', 'feat')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(blank, 'models', 'demo.model.lkml')))
+        with open(env) as f:
+            self.assertIn(SECRET, f.read())   # a filled .env is never overwritten
+        self.assertEqual(run('init', '--project', PROJECT).returncode, 2)  # already set up
+
+    def test_init_without_project_and_no_terminal_is_refused(self):
+        r = self.run_cli('init')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('--project', r.stdout)
+
+    def test_skill_prints_the_authoritative_file(self):
+        r = subprocess.run([sys.executable, CLI, 'skill'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        with open(os.path.join(os.path.dirname(CLI), '..', 'skills', 'looker-sync', 'SKILL.md')) as f:
+            self.assertEqual(r.stdout, f.read())
+        r = subprocess.run([sys.executable, CLI, 'skill', '--path'], capture_output=True, text=True)
+        self.assertTrue(r.stdout.strip().endswith('SKILL.md'))
+
+    def test_help_is_short_and_points_at_skill(self):
+        r = subprocess.run([sys.executable, CLI, '--help'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertLess(len(r.stdout.splitlines()), 45)
+        self.assertIn('looker-sync skill', r.stdout)
+
     # ---- pull
 
     def test_first_pull_writes_dev_files_and_never_touches_production(self):

@@ -4,11 +4,15 @@ Move LookML between a local folder and your own Looker dev workspace, with verif
 Python 3 standard library only.
 
 ```
-python3 scripts/looker_sync.py -C <project folder> --env-file <env> init --project <name> [--branch <b>]
-python3 scripts/looker_sync.py -C <project folder> status
-python3 scripts/looker_sync.py -C <project folder> push --dry-run
-python3 scripts/looker_sync.py -C <project folder> push
+uvx looker-sync init --project <name> [--branch <b>]   # works in a blank folder
+uvx looker-sync status
+uvx looker-sync push --dry-run
+uvx looker-sync push
+uvx looker-sync skill                                  # the full guide, written for agents
 ```
+
+`init` in a folder with no credentials writes an `.env` template and a `.gitignore` entry,
+then asks you to fill it in; run it again to pull.
 
 The env file holds `LOOKER_URL`, `LOOKER_CLIENT_ID` and `LOOKER_CLIENT_SECRET`, for an API
 key that belongs to **your own** Looker user.
@@ -19,7 +23,8 @@ key that belongs to **your own** Looker user.
   validation and prints `file:line  message`.
 - It refuses to overwrite a file edited in Looker since your last sync (`--force` to override).
 - `pull` never deletes local files and refuses to overwrite unpushed local work.
-- It never commits, deploys, resets or creates branches; those stay in the Looker IDE.
+- It never commits, deploys, resets or creates branches. Looker's API has no commit or push
+  endpoint, so committing stays with git and the Looker IDE.
 - A push that stops partway records what it wrote; the next push retries only the rest.
 
 ## One key, one branch at a time
@@ -31,3 +36,8 @@ browser IDE follows.
 Exit codes: 0 ok, 1 Looker or network error, 2 refused by a guard, 3 validation errors.
 
 Tests: `python3 -m unittest discover -s scripts -p 'test_looker_sync.py'`
+
+## Claude plugin
+
+The repo is also a Claude plugin: `skills/looker-sync/SKILL.md` is the one authoritative guide,
+shipped in the plugin and inside the package (`looker-sync skill` prints it).

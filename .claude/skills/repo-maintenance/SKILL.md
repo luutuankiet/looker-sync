@@ -18,6 +18,7 @@ crashing.
 
 | symptom | page | area | verified |
 |---|---|---|---|
+| a changed file shows git_status action add, so it looks like a new file | [MODIFIED_FILE_SHOWS_ACTION_ADD](../../../docs/traps/MODIFIED_FILE_SHOWS_ACTION_ADD.md) | file list / git_status | 2026-10-09 |
 | unit tests pass but push fails against real Looker with HTTP 400 No such file or directory | [TESTS_PASS_BUT_PUSH_FAILS_ON_THE_REAL_LOOKER](../../../docs/traps/TESTS_PASS_BUT_PUSH_FAILS_ON_THE_REAL_LOOKER.md) | tests / fake Looker | 2026-10-09 |
 
 ## Reference
@@ -34,6 +35,7 @@ Why the repo is the way it is. A merged decision is immutable -- supersede
 it with a new one rather than editing it.
 
 - [The tool writes files and never touches git state](../../../docs/adr/0001-read-and-write-files-only.md)
+- [No commit command; ship on PyPI with the skill inside](../../../docs/adr/0002-no-commit-command-and-uvx-distribution.md)
 
 <!-- END GENERATED INDEX -->
 
