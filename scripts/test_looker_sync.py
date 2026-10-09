@@ -8,6 +8,7 @@ workspace is per user, branch checkout carries uncommitted files, POST/PUT/DELET
 """
 import json
 import os
+import pty
 import subprocess
 import sys
 import tempfile
@@ -242,6 +243,26 @@ class CLITest(unittest.TestCase):
         with open(env) as f:
             self.assertIn(SECRET, f.read())   # a filled .env is never overwritten
         self.assertEqual(run('init', '--project', PROJECT).returncode, 2)  # already set up
+
+    def test_init_on_a_terminal_asks_for_project_and_pull(self):
+        master, slave = pty.openpty()
+        p = subprocess.Popen([sys.executable, CLI, '-C', self.dir, 'init', '--branch', 'feat'],
+                             stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        os.write(master, f'{PROJECT}\ny\n'.encode())
+        chunks = b''
+        while True:
+            try:
+                data = os.read(master, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks += data
+        self.assertEqual(p.wait(timeout=60), 0, chunks.decode(errors='replace'))
+        os.close(master)
+        self.assertNotIn(SECRET, chunks.decode(errors='replace'))
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, 'models', 'demo.model.lkml')))
 
     def test_init_without_project_and_no_terminal_is_refused(self):
         r = self.run_cli('init')

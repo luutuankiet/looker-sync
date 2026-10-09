@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "looker-sync"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pull and push LookML between a local folder and your own Looker dev workspace, with read-back verification."
 readme = "README.md"
 license = "MIT"

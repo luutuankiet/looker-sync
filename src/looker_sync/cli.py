@@ -405,7 +405,7 @@ def interactive():
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def ask(prompt, default=None):
+def prompt_text(prompt, default=None):
     shown = f'{prompt} [{default}]: ' if default else f'{prompt}: '
     return input(shown).strip() or default
 
@@ -440,7 +440,7 @@ def cmd_init(proj, args):
         raise Refused(f'{proj.config_path} already exists; edit it or remove it first')
     project = (proj.config or {}).get('project') or args.project
     if not project and interactive():
-        project = ask('Looker project id (the name in the Looker IDE)')
+        project = prompt_text('Looker project id (the name in the Looker IDE)')
     if not project:
         raise Refused('init needs --project <looker project id>')
     env_path = proj.env_path(args.env_file)
@@ -473,7 +473,7 @@ def cmd_init(proj, args):
     if args.no_pull:
         out('skipped the first pull; run: looker-sync pull')
         return OK
-    if interactive() and (ask('Pull the project files into this folder now? (y/n)', 'y') or 'y').lower() != 'y':
+    if interactive() and (prompt_text('Pull the project files into this folder now? (y/n)', 'y') or 'y').lower() != 'y':
         out('skipped the first pull; run: looker-sync pull')
         return OK
     return do_pull(proj, sess, args.force)

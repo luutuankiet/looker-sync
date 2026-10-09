@@ -1,7 +1,7 @@
 {
   "name": "looker-sync",
   "description": "Move LookML between a local folder and your own Looker dev workspace, with read-back verification.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "repository": "https://github.com/luutuankiet/looker-sync",
   "skills": ["./skills/looker-sync"]
