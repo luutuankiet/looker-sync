@@ -59,6 +59,10 @@ non-personal branch `personal: false, readonly: false`. A branch pushed with pla
 in the list as `is_local: false, is_remote: true` straight after the push, and checking it out
 by name answers 200 (seen during the design probe).
 
+**`DELETE /projects/{id}/git_branch/{name}`** in dev mode, on a branch you are not on, answered
+204 and removed the branch from the git remote as well, not only from the dev workspace:
+`git ls-remote` listed it just before and not just after. looker-sync never calls it.
+
 **Not verified live:** the exact spelling of the bare-model path, `git_service_name` for the
 bare and no-git shapes, the other fields of a remote-only branch, and `readonly` on a
 colleague's personal branch (needs two users).
