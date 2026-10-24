@@ -819,7 +819,8 @@ def cmd_status(proj, args):
 def do_push(proj, sess, force=False, delete=False, dry_run=False):
     if sess.mode != 'dev':
         raise Refused('push is refused in prod mode; switch --mode dev first')
-    # Not verified live with two users: the flag is what the branch resource reports.
+    # Not verified live with two users (a non-admin cannot see a project with no model in
+    # production, and the sandbox has none): the flag is what the branch resource reports.
     if (getattr(sess, 'branch_info', None) or {}).get('readonly'):
         raise Refused(f'Looker reports branch {sess.branch!r} as read-only for you, as a colleague\'s '
                       'personal branch is; review it, then switch to a branch of your own to push')
@@ -947,7 +948,10 @@ def git_checkout(proj, sess, target):
         if rc:
             raise Refused(f'git checkout {target} failed: {err}')
         out(f'git: checked out {target}')
-    ref, head = (getattr(sess, 'branch_info', None) or {}).get('ref'), g.head()
+    info = getattr(sess, 'branch_info', None) or {}
+    # Right after Looker checks out a branch that was only on the remote, it answers ref ''
+    # (verified live); its commit is then the remote's.
+    ref, head = info.get('ref') or info.get('remote_ref'), g.head()
     if not ref or ref == head:
         return
     if not g.has_commit(ref):

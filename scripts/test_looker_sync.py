@@ -34,7 +34,7 @@ SECRET = 'not-a-real-secret-9f8e7d'
 GIT_REMOTE_SHAPES = {
     'remote': (True, 'git@github.com:example/demo.git', 'github'),
     'https': (True, 'https://github.com/example/demo.git', 'github'),
-    'bare': (True, 'bare_models/demo.git', None),
+    'bare': (True, '../../bare_models/demo.git', None),
     'none': (False, None, None),
 }
 
@@ -58,6 +58,9 @@ class FakeLooker:
         self.set_git_remote('remote')
         self.branch_git = {}         # branch -> fields overriding the branch resource defaults
         self.remote_only = set()     # pushed with plain git, never checked out in Looker
+        # live: right after checking out a remote-only branch, GET git_branch still answers the
+        # remote-only shape (ref '', counts null) while the list already shows it local
+        self.stale_checkout = set()
         self.personal = {'feat'}     # live: the user's own dev branch is personal
         self.readonly = {'master'}   # live: the production branch is readonly in dev mode
 
@@ -77,7 +80,7 @@ class FakeLooker:
                 'git_production_branch_name': self.production_branch,
                 'pull_request_mode': 'off', 'validation_required': True, 'is_example': False}
 
-    def branch_resource(self, name):
+    def branch_resource(self, name, single=False):
         files = self.branches.get(name, {})
         # without GitRepos there is no real commit; a stable 40-hex stand-in keeps the shape
         ref = hashlib.sha1(json.dumps([name, sorted(files.items())]).encode()).hexdigest()
@@ -88,6 +91,9 @@ class FakeLooker:
                'ahead_count': 0, 'behind_count': 0, 'commit_at': 1700000000,
                'ref': ref, 'remote_ref': ref, 'can': {}}
         res.update(self.branch_git.get(name, {}))
+        if name in self.remote_only or (single and name in self.stale_checkout):
+            # live: a remote-only branch has no Looker commit yet, only the remote's
+            res.update(is_local=False, ref='', ahead_count=None, behind_count=None, personal=False)
         return res
 
     def dev_files(self):
@@ -162,7 +168,8 @@ class FakeLooker:
                     return self.reply(200, fake.project_resource())
                 if path == pre + '/git_branch':
                     if method == 'GET':
-                        return self.reply(200, fake.branch_resource(fake.dev_branch if dev else fake.production_branch))
+                        return self.reply(200, fake.branch_resource(fake.dev_branch if dev else fake.production_branch,
+                                                                    single=True))
                     if not dev:
                         return self.reply(403, {'message': 'dev mode only'})
                     if 'ref' in body:
@@ -172,8 +179,9 @@ class FakeLooker:
                     if body['name'] in fake.fail_checkout:
                         return self.reply(500, {'message': 'test fake: checkout failed'})
                     fake.dev_branch = body['name']
+                    fake.stale_checkout = {fake.dev_branch} & fake.remote_only
                     fake.remote_only.discard(fake.dev_branch)   # live: checkout by name makes it local
-                    return self.reply(200, fake.branch_resource(fake.dev_branch))
+                    return self.reply(200, fake.branch_resource(fake.dev_branch, single=True))
                 if path == pre + '/git_branches':
                     return self.reply(200, [fake.branch_resource(b) for b in fake.branches])
                 if path == pre + '/files' and method == 'GET':
@@ -743,11 +751,14 @@ class GitHarnessTest(GitTestCase):
         self.assertEqual((proj['uses_git'], proj['git_service_name'], proj['git_production_branch_name']),
                          (True, 'github', 'master'))
         self.assertTrue(proj['git_remote_url'].startswith('git@'))
+        # live: a Looker-hosted bare repository is a relative path two levels up, no service name
         self.fake.set_git_remote('bare')
-        self.assertFalse(self.looker_get(f'/projects/{PROJECT}')['git_remote_url'].startswith(('git@', 'https://', '/')))
+        proj = self.looker_get(f'/projects/{PROJECT}')
+        self.assertEqual((proj['uses_git'], proj['git_remote_url'], proj['git_service_name']),
+                         (True, f'../../bare_models/{PROJECT}.git', None))
         self.fake.set_git_remote('none')
         proj = self.looker_get(f'/projects/{PROJECT}')
-        self.assertEqual((proj['uses_git'], proj['git_remote_url']), (False, None))
+        self.assertEqual((proj['uses_git'], proj['git_remote_url'], proj['git_service_name']), (False, None, None))
         # Looker commits without pushing: ref is not in the remote, remote_ref is, ahead_count 1
         old = self.fake.branch_git['feat']['ref']
         sha = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'x.view.lkml': 'view: x {}\n'}), push=False)
@@ -759,8 +770,8 @@ class GitHarnessTest(GitTestCase):
         # a branch pushed with plain git is listed remote-only, and checkout by name makes it local
         review = self.repos.add_remote_only_branch('review', {'manifest.lkml': 'project_name: "demo"\n'})
         listed = {b['name']: b for b in self.looker_get(f'/projects/{PROJECT}/git_branches')}
-        self.assertEqual((listed['review']['is_local'], listed['review']['is_remote'], listed['review']['ref']),
-                         (False, True, review))
+        self.assertEqual((listed['review']['is_local'], listed['review']['is_remote'], listed['review']['ref'],
+                          listed['review']['remote_ref'], listed['review']['ahead_count']), (False, True, '', review, None))
         self.assertEqual((listed['master']['readonly'], listed['master']['is_production']), (True, True))
         self.assertEqual((listed['feat']['personal'], listed['feat']['readonly']), (True, False))
         self.git('fetch', '-q', 'origin')
@@ -769,7 +780,11 @@ class GitHarnessTest(GitTestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         r = self.run_cli('switch', '--branch', 'review', '--yes')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue(self.looker_get(f'/projects/{PROJECT}/git_branch')['is_local'])
+        listed = {b['name']: b for b in self.looker_get(f'/projects/{PROJECT}/git_branches')}
+        self.assertEqual((listed['review']['is_local'], listed['review']['ref']), (True, review))
+        # live: the current-branch resource lags behind the list right after that checkout
+        info = self.looker_get(f'/projects/{PROJECT}/git_branch')
+        self.assertEqual((info['name'], info['is_local'], info['ref'], info['remote_ref']), ('review', False, '', review))
 
 
 class GitLinkTest(GitTestCase):
@@ -1121,6 +1136,19 @@ class GitSwitchTest(GitTestCase):
         self.assertEqual(self.git('rev-parse', 'HEAD'), sha)
         self.assertNotEqual(old, sha)
         self.assertEqual(self.git('status', '--porcelain', '--', '.', ':(exclude).looker-sync', ':(exclude).env'), '')
+        self.assertIn(['merge', '--ff-only', '--quiet', sha], self.git_calls())
+
+    def test_first_checkout_of_a_remote_only_branch_fast_forwards_a_local_branch_behind_it(self):
+        # live: Looker answers ref '' for a branch it just checked out from the remote, so the
+        # remote's commit is the one Looker is on
+        old = self.repos.add_remote_only_branch('review', {'manifest.lkml': 'project_name: "demo"\n'})
+        self.git('fetch', '-q', 'origin')
+        self.git('branch', '-q', '--track', 'review', 'origin/review')
+        sha = self.repos.commit('review', {'manifest.lkml': 'project_name: "demo"\n', 'views/r.view.lkml': 'view: r {}\n'})
+        self.switch('--branch', 'review', '--force')
+        self.assertEqual(self.head(), 'review')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), sha)
+        self.assertNotEqual(old, sha)
         self.assertIn(['merge', '--ff-only', '--quiet', sha], self.git_calls())
 
     def test_diverged_local_branch_is_left_alone_with_a_warning(self):
