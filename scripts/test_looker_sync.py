@@ -34,7 +34,7 @@ SECRET = 'not-a-real-secret-9f8e7d'
 GIT_REMOTE_SHAPES = {
     'remote': (True, 'git@github.com:example/demo.git', 'github'),
     'https': (True, 'https://github.com/example/demo.git', 'github'),
-    'bare': (True, 'bare_models/demo.git', None),
+    'bare': (True, '../../bare_models/demo.git', None),
     'none': (False, None, None),
 }
 
@@ -751,11 +751,14 @@ class GitHarnessTest(GitTestCase):
         self.assertEqual((proj['uses_git'], proj['git_service_name'], proj['git_production_branch_name']),
                          (True, 'github', 'master'))
         self.assertTrue(proj['git_remote_url'].startswith('git@'))
+        # live: a Looker-hosted bare repository is a relative path two levels up, no service name
         self.fake.set_git_remote('bare')
-        self.assertFalse(self.looker_get(f'/projects/{PROJECT}')['git_remote_url'].startswith(('git@', 'https://', '/')))
+        proj = self.looker_get(f'/projects/{PROJECT}')
+        self.assertEqual((proj['uses_git'], proj['git_remote_url'], proj['git_service_name']),
+                         (True, f'../../bare_models/{PROJECT}.git', None))
         self.fake.set_git_remote('none')
         proj = self.looker_get(f'/projects/{PROJECT}')
-        self.assertEqual((proj['uses_git'], proj['git_remote_url']), (False, None))
+        self.assertEqual((proj['uses_git'], proj['git_remote_url'], proj['git_service_name']), (False, None, None))
         # Looker commits without pushing: ref is not in the remote, remote_ref is, ahead_count 1
         old = self.fake.branch_git['feat']['ref']
         sha = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'x.view.lkml': 'view: x {}\n'}), push=False)
