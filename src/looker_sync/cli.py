@@ -947,7 +947,10 @@ def git_checkout(proj, sess, target):
         if rc:
             raise Refused(f'git checkout {target} failed: {err}')
         out(f'git: checked out {target}')
-    ref, head = (getattr(sess, 'branch_info', None) or {}).get('ref'), g.head()
+    info = getattr(sess, 'branch_info', None) or {}
+    # Right after Looker checks out a branch that was only on the remote, it answers ref ''
+    # (verified live); its commit is then the remote's.
+    ref, head = info.get('ref') or info.get('remote_ref'), g.head()
     if not ref or ref == head:
         return
     if not g.has_commit(ref):
