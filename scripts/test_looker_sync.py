@@ -52,6 +52,7 @@ class FakeLooker:
         self.validation_errors = []
         self.mangle_readback = set()  # Looker stores different bytes than were sent
         self.fail_writes = set()  # writes to these paths answer 500
+        self.fail_checkout = set()  # checking out these branches answers 500
         # git fields, shaped as on a live instance
         self.production_branch = 'master'
         self.set_git_remote('remote')
@@ -168,6 +169,8 @@ class FakeLooker:
                         return self.reply(500, {'message': 'test fake: ref is forbidden'})
                     if body['name'] not in fake.branches:
                         return self.reply(404, {'message': 'Not found'})
+                    if body['name'] in fake.fail_checkout:
+                        return self.reply(500, {'message': 'test fake: checkout failed'})
                     fake.dev_branch = body['name']
                     fake.remote_only.discard(fake.dev_branch)   # live: checkout by name makes it local
                     return self.reply(200, fake.branch_resource(fake.dev_branch))
@@ -657,8 +660,23 @@ class GitTestCase(FakeLookerTestCase):
     """The project folder is a real clone of a bare remote, on the fake's dev branch.
 
     self.repos is the GitRepos behind the fake; every git process (the CLI's too) runs with
-    hermetic_git_env through os.environ for the length of the test.
+    hermetic_git_env through os.environ for the length of the test. The CLI appends one JSON
+    line per git call to self.git_log_path (see run_git in cli.py); git_calls() reads it.
     """
+
+    def setUp(self):
+        super().setUp()
+        self.git_log_path = os.path.join(self.tmp.name, 'git-calls.jsonl')
+        os.environ['LOOKER_SYNC_GIT_LOG'] = self.git_log_path
+
+    def git_calls(self):
+        if not os.path.exists(self.git_log_path):
+            return []
+        with open(self.git_log_path) as f:
+            return [json.loads(line)['args'] for line in f]
+
+    def config(self):
+        return json.loads(self.local('.looker-sync/config.json'))
 
     def make_project_dir(self):
         patcher = mock.patch.dict(os.environ, hermetic_git_env(self.tmp.name), clear=True)
@@ -758,21 +776,6 @@ class GitLinkTest(GitTestCase):
     """link, the init offer and the commit check: one user story per test."""
 
     LOOKER_URL = GIT_REMOTE_SHAPES['remote'][1]
-
-    def setUp(self):
-        super().setUp()
-        # the CLI appends one JSON line per git call here (see run_git in cli.py)
-        self.git_log_path = os.path.join(self.tmp.name, 'git-calls.jsonl')
-        os.environ['LOOKER_SYNC_GIT_LOG'] = self.git_log_path
-
-    def git_calls(self):
-        if not os.path.exists(self.git_log_path):
-            return []
-        with open(self.git_log_path) as f:
-            return [json.loads(line)['args'] for line in f]
-
-    def config(self):
-        return json.loads(self.local('.looker-sync/config.json'))
 
     def init_unlinked(self):
         r = self.run_cli('init', '--project', PROJECT, '--branch', 'feat', '--no-git')
@@ -1010,6 +1013,223 @@ class GitLinkTest(GitTestCase):
         self.assertIn('git: not linked', text)
         self.assertNotIn('git_remote', self.config())
         self.assertNotIn(['fetch', '--quiet', 'origin'], self.git_calls())
+
+
+class GitSwitchTest(GitTestCase):
+    """switch in a linked folder: Looker and the local git branch move together."""
+
+    NEVER = {'commit', 'push', 'pull', 'reset', 'rebase', 'clean'}
+
+    def setUp(self):
+        super().setUp()
+        r = self.init()   # a clone without a terminal: init links origin
+        self.assertEqual(self.config()['git_remote'], 'origin', r.stdout)
+
+    def tearDown(self):
+        calls = self.git_calls()
+        try:
+            self.assertEqual([a for a in calls if a[0] in self.NEVER], [])
+            self.assertEqual([a for a in calls if a[0] == 'stash' and a[1:2] != ['push']], [])
+        finally:
+            super().tearDown()
+
+    def switch(self, *args, code=0):
+        r = self.run_cli('switch', *args)
+        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        return r
+
+    def head(self):
+        return self.git('branch', '--show-current')
+
+    def stashes(self):
+        # git prefixes a -m message with "On <branch>: " in the stash subject; return the message
+        return [s.split(': ', 1)[1] if s.startswith('On ') else s
+                for s in self.git('stash', 'list', '--format=%s').splitlines()]
+
+    def test_forced_switch_stashes_dirty_tree_and_lands_both_sides_on_the_target(self):
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')   # modified, tracked
+        self.put_local('views/draft.view.lkml', 'view: draft {}\n')               # untracked, synced
+        self.put_local('notes.txt', 'my notes\n')                                # untracked, not synced
+        os.makedirs(os.path.join(self.dir, '.git', 'info'), exist_ok=True)   # no templates copied in
+        with open(os.path.join(self.dir, '.git', 'info', 'exclude'), 'a') as f:
+            f.write('scratch.log\n')
+        self.put_local('scratch.log', 'ignored\n')
+        r = self.switch('--branch', 'master', '--force')
+        self.assertEqual(self.fake.dev_branch, 'master')
+        self.assertEqual(self.head(), 'master')
+        self.assertEqual(self.config()['branch'], 'master')
+        [stash] = self.stashes()
+        self.assertRegex(stash, r'^looker-sync feat \d{8}T\d{6}$')
+        self.assertIn(stash, r.stdout)
+        self.assertIn('git stash pop', r.stdout)
+        self.assertEqual(self.local('scratch.log'), 'ignored\n')                  # ignored: untouched
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'notes.txt')))    # stashed
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'views/draft.view.lkml')))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, '.looker-sync', 'backups')))
+        self.assertEqual(self.local('manifest.lkml'), 'project_name: "demo"\n')
+        self.assertEqual(self.git('status', '--porcelain', '--', '.', ':(exclude).looker-sync', ':(exclude).env'), '')
+        # the stash holds the work: modified file in the stash commit, untracked ones in its third parent
+        self.assertIn('# mine', self.git('show', 'stash@{0}:views/orders.view.lkml'))
+        self.assertEqual(sorted(self.git('ls-tree', '-r', '--name-only', 'stash@{0}^3').split()),
+                         ['.gitignore', 'notes.txt', 'views/draft.view.lkml'])
+        # .looker-sync/ is in .gitignore, so only the env file is named: an exclude naming an
+        # ignored path makes git stash fail halfway
+        self.assertIn(['stash', 'push', '--include-untracked', '-m', stash, '--', '.',
+                       ':(exclude,literal).env'], self.git_calls())
+        self.assertFalse(any(b and 'ref' in b for m, p, _, b in self.fake.log if p.endswith('/git_branch')))
+
+    def test_stash_never_takes_the_metadata_folder_or_the_env_file(self):
+        os.remove(os.path.join(self.dir, '.gitignore'))   # nothing tells git to ignore them
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        self.switch('--branch', 'master', '--force')
+        [stash] = self.stashes()
+        self.assertIn(['stash', 'push', '--include-untracked', '-m', stash, '--', '.',
+                       ':(exclude,literal).looker-sync', ':(exclude,literal).env'], self.git_calls())
+        for p in ('.looker-sync/config.json', '.looker-sync/state.json', '.env'):
+            self.assertTrue(os.path.isfile(os.path.join(self.dir, p)), p)
+        self.assertNotIn('.looker-sync', self.git('ls-tree', '-r', '--name-only', 'stash@{0}^3'))
+        self.assertNotIn('.env', self.git('ls-tree', '-r', '--name-only', 'stash@{0}^3').split())
+        self.assertEqual(self.run_cli('status').returncode, 0)
+
+    def test_switch_to_a_branch_with_no_local_branch_creates_it_tracking_the_remote(self):
+        self.assertNotEqual(self.git_try('rev-parse', '--verify', '-q', 'refs/heads/master').returncode, 0)
+        self.switch('--branch', 'master', '--force')
+        self.assertEqual(self.head(), 'master')
+        self.assertEqual(self.git('rev-parse', '--abbrev-ref', 'master@{upstream}'), 'origin/master')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.fake.branch_git['master']['ref'])
+
+    def test_local_branch_behind_looker_is_fast_forwarded(self):
+        self.switch('--branch', 'master', '--force')
+        old = self.git('rev-parse', 'feat')
+        sha = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'views/n.view.lkml': 'view: n {}\n'}))
+        self.switch('--branch', 'feat', '--force')
+        self.assertEqual(self.head(), 'feat')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), sha)
+        self.assertNotEqual(old, sha)
+        self.assertEqual(self.git('status', '--porcelain', '--', '.', ':(exclude).looker-sync', ':(exclude).env'), '')
+        self.assertIn(['merge', '--ff-only', '--quiet', sha], self.git_calls())
+
+    def test_diverged_local_branch_is_left_alone_with_a_warning(self):
+        self.switch('--branch', 'master', '--force')
+        # a local commit on feat that Looker does not have, and a Looker commit the clone lacks
+        tree = self.git('rev-parse', 'feat^{tree}')
+        mine = self.git('commit-tree', tree, '-p', 'feat', '-m', 'local work')
+        self.git('update-ref', 'refs/heads/feat', mine)
+        theirs = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'views/t.view.lkml': 'view: t {}\n'}))
+        r = self.switch('--branch', 'feat', '--force')
+        self.assertEqual(self.head(), 'feat')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), mine)
+        self.assertIn('warning', r.stdout)
+        self.assertIn('diverged', r.stdout)
+        self.assertIn(theirs[:12], r.stdout)
+        self.assertFalse([a for a in self.git_calls() if a[0] == 'merge'])
+        self.assertEqual(self.local('views/t.view.lkml'), 'view: t {}\n')    # Looker's files mirrored
+
+    def test_uncommitted_files_in_looker_refuse_even_with_force_and_git_does_not_move(self):
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        self.fake.dev_write('models/demo.model.lkml', 'connection: "other"\n')
+        r = self.switch('--branch', 'master', '--force', code=2)
+        self.assertIn('models/demo.model.lkml  (Modified)', r.stdout)
+        self.assertEqual((self.fake.dev_branch, self.head(), self.stashes()), ('feat', 'feat', []))
+        self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders { # mine\n}\n')
+        self.assertFalse([a for a in self.git_calls() if a[0] in ('stash', 'checkout', 'merge')])
+
+    def test_failed_looker_checkout_leaves_the_git_branch_where_it_was(self):
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        self.fake.fail_checkout.add('master')
+        r = self.switch('--branch', 'master', '--force', code=1)
+        self.assertIn('checkout failed', r.stdout)
+        self.assertEqual((self.fake.dev_branch, self.head(), self.stashes()), ('feat', 'feat', []))
+        self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders { # mine\n}\n')
+        self.assertEqual(self.config()['branch'], 'feat')
+        self.assertFalse([a for a in self.git_calls() if a[0] in ('stash', 'checkout', 'merge')])
+
+    def test_remote_only_branch_is_reachable_and_a_local_only_branch_refuses(self):
+        review = self.repos.add_remote_only_branch('review', {'manifest.lkml': 'project_name: "demo"\n',
+                                                              'views/r.view.lkml': 'view: r {}\n'})
+        self.switch('--branch', 'review', '--force')
+        self.assertEqual((self.fake.dev_branch, self.head()), ('review', 'review'))
+        self.assertEqual(self.git('rev-parse', 'HEAD'), review)
+        self.assertEqual(self.local('views/r.view.lkml'), 'view: r {}\n')
+        self.git('branch', 'mine')   # made with git, never pushed, unknown to Looker
+        r = self.switch('--branch', 'mine', '--force', code=2)
+        self.assertIn('push it', r.stdout)
+        self.assertEqual((self.fake.dev_branch, self.head()), ('review', 'review'))
+        self.assertNotIn('mine', self.fake.branches)
+
+    def test_switch_to_prod_checks_out_the_production_branch_in_git(self):
+        self.fake.production_branch = 'master'
+        self.switch('--mode', 'prod', '--force')
+        self.assertEqual(self.head(), 'master')
+        self.assertEqual(self.config()['mode'], 'prod')
+        self.assertEqual(self.git('status', '--porcelain', '--', '.', ':(exclude).looker-sync', ':(exclude).env'), '')
+        self.assertEqual(self.run_cli('status').returncode, 0)
+        r = self.switch('--mode', 'prod', '--force')
+        self.assertIn('nothing to switch', r.stdout)
+        self.switch('--mode', 'dev', '--force')
+        self.assertEqual(self.head(), 'feat')
+        self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders {}\n')
+
+    def test_git_drift_is_fixed_by_switch_instead_of_nothing_to_do(self):
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')   # by hand, behind looker-sync's back
+        r = self.switch('--branch', 'feat', '--force')
+        self.assertNotIn('nothing to switch', r.stdout)
+        self.assertEqual((self.fake.dev_branch, self.head()), ('feat', 'feat'))
+        self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders {}\n')
+        self.assertFalse([e for e in self.fake.log if e[0] == 'PUT' and e[1].endswith('/git_branch')])
+        r = self.switch('--branch', 'feat', '--force')
+        self.assertIn('nothing to switch', r.stdout)
+        self.git('checkout', '-q', '--detach')   # a detached HEAD is drift too
+        r = self.switch('--branch', 'feat', '--force')
+        self.assertNotIn('nothing to switch', r.stdout)
+        self.assertEqual(self.head(), 'feat')
+
+    def test_force_is_backup_plus_yes_and_without_it_the_prompts_still_guard(self):
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        r = self.switch('--branch', 'master', code=2)
+        self.assertIn('--local-changes', r.stdout)
+        r = self.switch('--branch', 'master', '--local-changes', 'backup', code=2)
+        self.assertIn('--yes', r.stdout)
+        self.assertEqual((self.fake.dev_branch, self.head(), self.stashes()), ('feat', 'feat', []))
+        self.switch('--branch', 'master', '--local-changes', 'backup', '--yes')
+        self.assertEqual(self.head(), 'master')
+        self.assertEqual(len(self.stashes()), 1)
+
+    def test_mirror_relists_after_the_git_checkout_and_tolerates_files_it_removed(self):
+        # pushed with plain git onto master: in the checkout, not in Looker's files
+        self.repos.commit('master', dict(self.fake.branches['master'], **{'views/g.view.lkml': 'view: g {}\n'}),
+                          looker=False)
+        r = self.switch('--branch', 'master', '--force')
+        # the checkout already removed feat's models and views; only what it left was listed and removed
+        self.assertIn('removed 2 old local file(s)', r.stdout)
+        for p in ('models/demo.model.lkml', 'views/orders.view.lkml', 'views/g.view.lkml'):
+            self.assertFalse(os.path.exists(os.path.join(self.dir, p)), p)
+        self.assertEqual(self.local('manifest.lkml'), 'project_name: "demo"\n')
+        self.assertEqual(self.run_cli('status').returncode, 0)
+
+    def test_push_choice_is_refused_while_git_has_drifted(self):
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')   # by hand: feat's files are gone
+        r = self.switch('--branch', 'feat', '--local-changes', 'push', '--yes', code=2)
+        self.assertIn('belong to another branch', r.stdout)
+        self.assertFalse([e for e in self.fake.log if e[0] in ('POST', 'PUT', 'DELETE') and '/files' in e[1]])
+        self.assertEqual(sorted(self.fake.dev_files()), sorted(self.fake.branches['feat']))
+        self.assertEqual(self.head(), 'master')
+
+    def test_no_stash_pop_commit_push_pull_reset_rebase_or_clean_across_a_review_round_trip(self):
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        self.repos.add_remote_only_branch('review', {'manifest.lkml': 'project_name: "demo"\n'})
+        self.switch('--branch', 'review', '--force')
+        self.switch('--mode', 'prod', '--force')
+        self.switch('--mode', 'dev', '--force')
+        self.switch('--branch', 'feat', '--force')
+        self.assertEqual(self.head(), 'feat')
+        calls = self.git_calls()
+        self.assertTrue(any(a[0] == 'stash' for a in calls))
+        self.assertTrue(any(a[0] == 'checkout' for a in calls))
+        self.assertEqual({a[0] for a in calls} - {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base',
+                                                   'remote', 'fetch', 'stash', 'checkout', 'merge'}, set())
+        self.assertEqual(len(self.stashes()), 1)   # never popped
+        # the tearDown check asserts the never-list on every test of this class
 
 
 if __name__ == '__main__':
