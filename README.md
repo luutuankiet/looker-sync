@@ -33,11 +33,12 @@ and never written anywhere else.
 
 | command | what it does |
 |---|---|
-| `init [--project P] [--mode dev\|prod] [--branch B]` | set up a folder (it may be empty), then a first pull. `--no-pull` writes metadata only; `--force` takes Looker's copy over files already there |
+| `init [--project P] [--mode dev\|prod] [--branch B] [--git-remote NAME \| --no-git]` | set up a folder (it may be empty), then a first pull. `--no-pull` writes metadata only; `--force` takes Looker's copy over files already there. In a git clone it links the folder to a remote (asks on a terminal, else tries `origin`); `--no-git` skips |
+| `link [--remote NAME]` | link an existing folder to a git remote of its clone (default `origin`), so git and Looker stay on the same branch |
 | `pull [--force] [--dry-run]` | copy Looker files to disk; never deletes local files |
 | `status` | show what differs on each side, and how far the dev branch is ahead of and behind its remote; writes nothing |
 | `push [--force] [--delete] [--dry-run]` | write local changes, read every file back, then validate |
-| `switch (--branch B \| --mode dev\|prod)` | move Looker and the folder to another branch or mode |
+| `switch (--branch B \| --mode dev\|prod) [--force]` | move Looker and the folder to another branch or mode. `--force` = back up local changes and confirm. In a linked folder it also stashes a dirty tree, checks out B in git and fast-forwards it to Looker's commit; it never pops the stash |
 | `skill [--path]` | print the full usage guide written for agents |
 
 Global options: `-C <project folder>` (default: the current folder) and `--env-file <path>`.
@@ -56,7 +57,7 @@ Exit codes: 0 ok, 1 Looker or network error, 2 refused by a guard, 3 validation 
 
 ## What it does not do
 
-It never commits, pushes to git, deploys, resets or creates branches. Looker's API has no
+It never commits, pushes to git, deploys, resets or creates branches. In a linked folder it only reads, fetches, stashes, checks out and fast-forwards local git; `status` warns and `pull`/`push` refuse when git is on another branch, printing the `switch` command that fixes it. Looker's API has no
 commit or push endpoint, and the official Looker VS Code extension commits through local git
 too. Pushed files show up in the dev workspace as uncommitted changes; commit them from the
 Looker IDE or your own git checkout of the remote.

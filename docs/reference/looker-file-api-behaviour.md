@@ -1,7 +1,7 @@
 ---
 title: Looker file and branch API behaviour (live-verified)
 summary: How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance
-verified: 2026-10-09
+verified: 2026-10-24
 ---
 
 # Looker file and branch API behaviour
@@ -37,3 +37,28 @@ by the extension, so they are not known from this source.
 
 `GET /projects/{id}/git_branch` returns `ahead_count`, `behind_count`, `ref` and `remote_ref`;
 `status` prints the counts.
+
+## Git fields of the project and branch resources (verified 2026-10-24)
+
+Read in dev mode on the sandbox project; field names and shapes only. The fake Looker serves
+the subset `looker-sync` reads.
+
+**`GET /projects/{id}`.** `uses_git` (bool), `git_remote_url`, `git_production_branch_name`,
+`pull_request_mode` (a short string such as `off`), `git_service_name` (`github` for a GitHub
+remote). `git_remote_url` takes three shapes: a normal remote URL (SSH or HTTPS), a relative
+path into Looker's own bare-model store for a Looker-hosted repository, or null for a project
+without a remote. `looker-sync link` accepts only the first.
+
+**`GET /projects/{id}/git_branch` and each entry of `GET /projects/{id}/git_branches`** carry
+the same keys: `name`, `ref`, `remote_ref`, `ahead_count`, `behind_count`, `readonly`,
+`personal`, `is_local`, `is_remote`, `is_production`, `remote`, `remote_name`, `error`,
+`message` (empty strings when fine), `owner_name`, `commit_at` (an int, epoch seconds) and
+`can` (an object). In dev mode the production branch reads `readonly: true, personal: false,
+is_production: true`; your own dev branch `personal: true, readonly: false`; a shared
+non-personal branch `personal: false, readonly: false`. A branch pushed with plain git appears
+in the list as `is_local: false, is_remote: true` straight after the push, and checking it out
+by name answers 200 (seen during the design probe).
+
+**Not verified live:** the exact spelling of the bare-model path, `git_service_name` for the
+bare and no-git shapes, the other fields of a remote-only branch, and `readonly` on a
+colleague's personal branch (needs two users).
