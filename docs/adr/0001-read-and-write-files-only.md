@@ -10,3 +10,5 @@ wrong commit or reset in Looker is hard to undo, an agent running unattended is 
 careful actor, and the dev workspace keeps pushed files as uncommitted changes, so nothing is
 lost. `switch` copies the IDE: it refuses while Looker holds uncommitted files, because the
 API's own checkout silently carries them onto the target branch.
+
+Superseded by [0003](0003-never-touch-lookers-git-and-a-narrow-local-git-scope.md).

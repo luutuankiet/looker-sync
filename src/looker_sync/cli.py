@@ -8,14 +8,19 @@ endpoint, so those stay with git and the Looker IDE.
     looker-sync [-C PROJECT_DIR] [--env-file PATH] COMMAND ...
 
     init    [--project P] [--mode dev|prod] [--branch B]  set up a folder, then a first pull
+            [--git-remote NAME | --no-git]                link to git, or not (default: offer)
+    link    [--remote NAME]                               link the folder to a git remote
     pull    [--force] [--dry-run]                         copy Looker files to disk
     status                                                show what differs on each side
     push    [--force] [--delete] [--dry-run]              write local edits, read back, validate
-    switch  (--branch B | --mode dev|prod) [--local-changes push|backup|cancel] [--yes]
+    switch  (--branch B | --mode dev|prod) [--local-changes push|backup|cancel] [--yes] [--force]
+            --force = --local-changes backup --yes; when linked, git follows: stash, checkout, ff
     skill   [--path]                                      print the full usage guide for agents
 
 Metadata lives in PROJECT_DIR/.looker-sync/ (config.json, state.json, backups/). Credentials
-come only from the env file: LOOKER_URL, LOOKER_CLIENT_ID, LOOKER_CLIENT_SECRET.
+come only from the env file: LOOKER_URL, LOOKER_CLIENT_ID, LOOKER_CLIENT_SECRET. A folder whose
+config names a `git_remote` is linked: every command first checks that the clone holds the
+commit Looker is on. Without `git_remote` no git process is ever started.
 
 Exit codes: 0 ok, 1 Looker or network error, 2 refused by a guard, 3 validation errors.
 """
@@ -26,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -214,6 +220,262 @@ class Project:
         return os.path.join(self.root, '.env')
 
 
+# ---------------------------------------------------------------- local git
+#
+# Every git process goes through run_git, so the scope rule is checked in this one place.
+# Allowed: reads, `fetch`, `stash push`, `checkout` (including creating a branch from its remote
+# counterpart) and `merge --ff-only`. Never: commit, push, pull, reset, rebase, clean, or popping
+# a stash. Looker's own git state is never touched (see the branch endpoint and `ref` above).
+# Only a linked folder (config key `git_remote`, a remote *name*) or the init offer in a folder
+# that looks like a git clone ever reaches run_git.
+#
+# LOOKER_SYNC_GIT_LOG names a file; when set, run_git appends one JSON line per call:
+# {"args": [...], "cwd": "...", "rc": N}. Tests read it to assert which git commands ran. It
+# records arguments and exit codes only, never git's output.
+
+GIT_READS = {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base', 'remote'}
+GIT_ALLOWED = GIT_READS | {'fetch', 'stash', 'checkout', 'merge'}
+
+
+def git_in_scope(args):
+    cmd = args[0] if args else None
+    if cmd not in GIT_ALLOWED:
+        return False
+    if cmd == 'remote':
+        return args[1:2] == ['get-url']
+    if cmd == 'stash':
+        return args[1:2] == ['push']
+    if cmd == 'merge':
+        return '--ff-only' in args
+    if cmd == 'checkout' and '-b' in args:
+        return '--track' in args      # a new branch only ever tracks its remote counterpart
+    return True
+
+
+def run_git(root, *args, timeout=60):
+    """Run `git -C root ARGS`; return (returncode, stdout, stderr), both stripped."""
+    args = list(args)
+    if not git_in_scope(args):
+        raise RuntimeError(f'git {" ".join(args)} is outside the git scope of looker-sync')
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')   # never hang on a credential prompt
+    try:
+        r = subprocess.run(['git', '-C', root, *args], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout, env=env)
+        rc, stdout, stderr = r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        rc, stdout, stderr = 127, '', 'git is not installed or not on PATH'
+    except subprocess.TimeoutExpired:
+        rc, stdout, stderr = 124, '', f'timed out after {timeout}s'
+    log = os.environ.get('LOOKER_SYNC_GIT_LOG')
+    if log:
+        with open(log, 'a') as f:
+            f.write(json.dumps({'args': args, 'cwd': root, 'rc': rc}) + '\n')
+    return rc, stdout.strip(), stderr.strip()
+
+
+def looks_like_git(root):
+    """True when root or a parent holds a .git entry. Pure Python: spawns no git."""
+    d = os.path.abspath(root)
+    while True:
+        if os.path.exists(os.path.join(d, '.git')):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+class LocalGit:
+    """Reads of the local clone at root, all through run_git."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def run(self, *args, **kw):
+        return run_git(self.root, *args, **kw)
+
+    def is_work_tree(self):
+        rc, stdout, _ = self.run('rev-parse', '--is-inside-work-tree')
+        return rc == 0 and stdout == 'true'
+
+    def branch(self):
+        """The checked-out branch, or None on a detached HEAD."""
+        rc, stdout, _ = self.run('symbolic-ref', '--quiet', '--short', 'HEAD')
+        return stdout if rc == 0 and stdout else None
+
+    def dirty(self, exclude=()):
+        """Changed and untracked paths under root, leaving out the `exclude` paths (relative)."""
+        rc, stdout, stderr = self.run('status', '--porcelain', '--untracked-files=all', *pathspecs(exclude))
+        if rc:
+            raise Refused(f'git status failed in {self.root}: {stderr}')
+        return stdout.splitlines()
+
+    def ignored(self, paths):
+        """The given relative paths that git ignores."""
+        rc, stdout, _ = self.run('status', '--porcelain', '--ignored=matching', '--untracked-files=normal',
+                                 '--', *[f':(literal){p}' for p in paths])
+        found = {line[3:].rstrip('/') for line in stdout.splitlines() if line.startswith('!! ')}
+        return [p for p in paths if p in found]
+
+    def has_ref(self, ref):
+        return self.run('rev-parse', '--verify', '--quiet', ref)[0] == 0
+
+    def head(self):
+        rc, stdout, _ = self.run('rev-parse', 'HEAD')
+        return stdout if rc == 0 else None
+
+    def short_head(self):
+        rc, stdout, _ = self.run('rev-parse', '--short', 'HEAD')
+        return stdout if rc == 0 else None
+
+    def has_commit(self, sha):
+        if not sha or not re.fullmatch(r'[0-9a-f]{4,64}', sha):
+            return False
+        return self.run('cat-file', '-e', sha + '^{commit}')[0] == 0
+
+    def is_ancestor(self, a, b):
+        return self.run('merge-base', '--is-ancestor', a, b)[0] == 0
+
+    def remote_url(self, name):
+        rc, stdout, _ = self.run('remote', 'get-url', name)
+        return stdout if rc == 0 else None
+
+    def fetch(self, remote):
+        """None on success, else the last line of git's complaint."""
+        rc, _, stderr = self.run('fetch', '--quiet', remote, timeout=180)
+        return None if rc == 0 else (stderr.splitlines() or [f'exit {rc}'])[-1]
+
+
+def pathspecs(exclude):
+    """`-- . :(exclude,literal)P ...`: the whole folder except the given relative paths."""
+    return ['--', '.'] + [f':(exclude,literal){p}' for p in exclude]
+
+
+def own_paths(proj, env_flag=None):
+    """The tool's own paths inside the folder, relative: never git's business, whatever .gitignore says."""
+    paths = [META_DIR]
+    env = os.path.abspath(proj.env_path(env_flag))
+    if env.startswith(proj.root + os.sep):
+        paths.append(os.path.relpath(env, proj.root).replace(os.sep, '/'))
+    return paths
+
+
+def git_target(sess, mode, branch):
+    """The git branch a folder in `mode` (dev: on Looker branch `branch`) belongs on."""
+    if mode == 'dev':
+        return branch
+    return (sess.project_info() or {}).get('git_production_branch_name') or sess.branch
+
+
+def expected_git_branch(proj, sess):
+    """The git branch the config says the folder is on: the config branch in dev mode, Looker's
+    production branch name in prod mode (falling back to the branch Looker reports)."""
+    cfg = proj.require_config()
+    return git_target(sess, cfg['mode'], cfg.get('branch'))
+
+
+def git_drift(proj, sess):
+    """(expected, actual) when a linked folder's git branch is not the expected one, else None.
+    actual is None on a detached HEAD. An unlinked folder never drifts and spawns no git."""
+    if not (proj.config or {}).get('git_remote'):
+        return None
+    expected, actual = expected_git_branch(proj, sess), LocalGit(proj.root).branch()
+    return None if actual == expected else (expected, actual)
+
+
+def drift_guard(proj, sess, cmd, refuse):
+    """In a linked folder off the expected branch: status warns (refuse False); pull and push
+    refuse, so one branch's files never land on another branch's checkout. Both print the fix."""
+    drift = git_drift(proj, sess)
+    if not drift:
+        return
+    expected, actual = drift
+    cfg = proj.require_config()
+    where = f'{actual!r}' if actual else 'a detached HEAD'
+    fix = f'looker-sync switch --branch {cfg["branch"]} --force' if cfg['mode'] == 'dev' else \
+        'looker-sync switch --mode prod --force'
+    if refuse:
+        raise Refused(f'git is on {where}, not {expected!r}, so {cmd} would sync one branch\'s files '
+                      f'with another branch\'s checkout. Put git back on {expected!r} with:\n    {fix}')
+    out(f'warning: git is on {where}, not {expected!r}; pull and push refuse until it is back. Fix:\n    {fix}')
+
+
+# A real remote is a URL with a scheme or scp-like `user@host:path`. Anything else Looker
+# reports (live: a relative path into its own bare-model store) is a Looker-hosted repository.
+REMOTE_URL = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://|[^/\s@:]+@[^/\s:]+:')
+REMOTE_NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._/-]*\Z')
+
+
+def safe_url(url):
+    """A remote URL fit to print: user info of an http(s) URL (it can hold a token) is masked."""
+    return re.sub(r'^(https?://)[^/@]*@', r'\1***@', url) if url else '(none)'
+
+
+def not_linkable(info, project):
+    """Why a Looker project cannot be linked to a clone, or None."""
+    if not info.get('uses_git'):
+        return f'Looker project {project!r} does not use git, so there is no repository to clone'
+    url = info.get('git_remote_url')
+    if not url:
+        return f'Looker reports no remote repository for project {project!r}, so there is nothing to clone'
+    if not REMOTE_URL.match(url):
+        return (f'project {project!r} keeps its git in a Looker-hosted bare repository ({url}), '
+                'so there is nothing to clone')
+    return None
+
+
+def commit_check(proj, sess, remote):
+    """Prove the clone and the Looker project are one repository: Looker's commit is local.
+
+    Fetch first (a failure only warns). Then Looker's `ref`, else `remote_ref`, must exist in
+    the clone. If neither does and Looker reports unpushed commits, warn; otherwise refuse,
+    printing both remote URLs. No URL is ever compared. Returns the local remote's URL.
+    """
+    g = LocalGit(proj.root)
+    if not g.is_work_tree():
+        raise Refused(f'{proj.root} is not a git work tree, so it cannot be linked to remote {remote!r}')
+    local_url = g.remote_url(remote)
+    if local_url is None:
+        raise Refused(f'no git remote named {remote!r} in {proj.root}; '
+                      'list them with `git remote -v`, then: looker-sync link --remote NAME')
+    err = g.fetch(remote)
+    if err:
+        out(f'warning: git fetch {remote} failed ({err}); checking against what was fetched before')
+    info = getattr(sess, 'branch_info', None) or {}
+    name, ref, remote_ref = info.get('name') or sess.branch, info.get('ref'), info.get('remote_ref')
+    if not (ref or remote_ref):
+        out(f'warning: Looker reported no commit for branch {name!r}; the clone was not checked')
+        return local_url
+    if g.has_commit(ref) or g.has_commit(remote_ref):
+        return local_url
+    shown = (ref or remote_ref)[:12]
+    ahead = info.get('ahead_count') or 0
+    if ahead > 0:
+        out(f"warning: Looker's branch {name!r} is on {shown}, which this clone does not have; it has "
+            f'{ahead} commit(s) Looker has not pushed to the remote yet. Push them from the Looker IDE.')
+        return local_url
+    looker_url = (sess.project_info() or {}).get('git_remote_url')
+    raise Refused(f"this clone does not have commit {shown}, which Looker's branch {name!r} is on, even "
+                  f'after fetching {remote!r}. It looks like a clone of a different repository.\n'
+                  f"    Looker's remote:  {safe_url(looker_url)}\n"
+                  f'    remote {remote!r}:  {safe_url(local_url)}\n'
+                  '  Point the remote at the right repository (git remote set-url), or link another '
+                  'one: looker-sync link --remote NAME')
+
+
+def link_folder(proj, sess, remote):
+    """Check everything, then write `git_remote` to the config. Returns the remote's URL."""
+    if not REMOTE_NAME.match(remote or ''):
+        raise Refused(f'{remote!r} is not a git remote name; give the name (such as origin), not a URL')
+    reason = not_linkable(sess.project_info() or {}, sess.project)
+    if reason:
+        raise Refused(reason)
+    url = commit_check(proj, sess, remote)
+    proj.config['git_remote'] = remote
+    proj.save_config()
+    return url
+
+
 # ---------------------------------------------------------------- session
 
 class Session:
@@ -245,9 +507,15 @@ class Session:
         if status >= 400:
             if self.mode == 'dev':
                 raise LookerError(f'GET git_branch -> HTTP {status}: {b}')
+            self.branch_info = None   # never fast-forward production to a stale dev ref
             return None
         self.branch_info = b
         return b.get('name')
+
+    def project_info(self):
+        if not hasattr(self, '_project_info'):
+            self._project_info = self.L.call('GET', f'/projects/{self.project}')
+        return self._project_info
 
     def file_list(self):
         return self.L.call('GET', f'/projects/{self.project}/files') or []
@@ -302,8 +570,12 @@ class Session:
 
 
 def open_session(proj, args, check_branch=True):
+    """The Looker session every command starts with; in a linked folder, the commit check too."""
     cfg = proj.require_config()
-    return Session(proj, args.env_file, cfg['mode'], cfg['project'], cfg.get('branch'), check_branch)
+    sess = Session(proj, args.env_file, cfg['mode'], cfg['project'], cfg.get('branch'), check_branch)
+    if cfg.get('git_remote'):
+        commit_check(proj, sess, cfg['git_remote'])
+    return sess
 
 
 # ---------------------------------------------------------------- sync plan
@@ -470,21 +742,69 @@ def cmd_init(proj, args):
         proj.save_config()
         out(f'wrote {os.path.relpath(proj.config_path, proj.root)}')
     ensure_gitignore(proj.root, [META_DIR + '/'])
+    init_git(proj, sess, args)
     if args.no_pull:
         out('skipped the first pull; run: looker-sync pull')
         return OK
     if interactive() and (prompt_text('Pull the project files into this folder now? (y/n)', 'y') or 'y').lower() != 'y':
         out('skipped the first pull; run: looker-sync pull')
         return OK
+    drift_guard(proj, sess, 'pull', refuse=True)   # a clone off Looker's branch: link, then refuse
     return do_pull(proj, sess, args.force)
 
 
+def init_git(proj, sess, args):
+    """The link offer: a flag decides; else ask on a terminal; else try origin and say so."""
+    later = 'run `looker-sync link [--remote NAME]` to link this folder to a git remote later'
+    if args.no_git:
+        out(f'git: not linked (--no-git); {later}')
+        return
+    if proj.config.get('git_remote'):
+        return
+    if args.git_remote:
+        url = link_folder(proj, sess, args.git_remote)
+        out(f'git: linked to git remote {args.git_remote!r} ({safe_url(url)})')
+        return
+    if not looks_like_git(proj.root) or not LocalGit(proj.root).is_work_tree():
+        return
+    if interactive():
+        ans = prompt_text('This folder is a git clone. Link this folder to a git remote, so looker-sync '
+                          'keeps the git branch and the Looker branch together? Remote name, or n to skip',
+                          'origin')
+        if ans.lower() in ('n', 'no'):
+            out(f'git: not linked; {later}')
+            return
+        url = link_folder(proj, sess, ans)
+        out(f'git: linked to git remote {ans!r} ({safe_url(url)})')
+        return
+    try:
+        url = link_folder(proj, sess, 'origin')
+    except Refused as e:
+        out(f"git: not linked. The default without a terminal is to link remote 'origin', and that was "
+            f'refused: {e}\n  Fix it and {later}, or pass --no-git to skip the attempt.')
+        return
+    out(f"git: linked to git remote 'origin' ({safe_url(url)}), the default without a terminal; "
+        'pass --no-git to skip')
+
+
+def cmd_link(proj, args):
+    cfg = proj.require_config()
+    sess = Session(proj, args.env_file, cfg['mode'], cfg['project'], cfg.get('branch'))
+    url = link_folder(proj, sess, args.remote)
+    out(f'linked to git remote {args.remote!r} ({safe_url(url)}); every command now checks that this '
+        'clone holds the commit Looker is on')
+    return OK
+
+
 def cmd_pull(proj, args):
-    return do_pull(proj, open_session(proj, args), args.force, args.dry_run)
+    sess = open_session(proj, args)
+    drift_guard(proj, sess, 'pull', refuse=True)
+    return do_pull(proj, sess, args.force, args.dry_run)
 
 
 def cmd_status(proj, args):
     sess = open_session(proj, args)
+    drift_guard(proj, sess, 'status', refuse=False)
     kinds = plan(proj.local_files(), sess.remote_files(), proj.state.get('files', {}))
     show(kinds, 'status')
     info = getattr(sess, 'branch_info', None) or {}
@@ -499,6 +819,10 @@ def cmd_status(proj, args):
 def do_push(proj, sess, force=False, delete=False, dry_run=False):
     if sess.mode != 'dev':
         raise Refused('push is refused in prod mode; switch --mode dev first')
+    # Not verified live with two users: the flag is what the branch resource reports.
+    if (getattr(sess, 'branch_info', None) or {}).get('readonly'):
+        raise Refused(f'Looker reports branch {sess.branch!r} as read-only for you, as a colleague\'s '
+                      'personal branch is; review it, then switch to a branch of your own to push')
     local, remote = proj.local_files(), sess.remote_files()
     kinds = plan(local, remote, proj.state.get('files', {}))
     show(kinds, 'push plan')
@@ -556,7 +880,9 @@ def do_push(proj, sess, force=False, delete=False, dry_run=False):
 
 
 def cmd_push(proj, args):
-    return do_push(proj, open_session(proj, args), args.force, args.delete, args.dry_run)
+    sess = open_session(proj, args)
+    drift_guard(proj, sess, 'push', refuse=True)
+    return do_push(proj, sess, args.force, args.delete, args.dry_run)
 
 
 def ask(question, choices):
@@ -567,22 +893,105 @@ def ask(question, choices):
                 return c
 
 
+def backup_copy(proj, files, label):
+    """Copy files ({path: bytes}) to .looker-sync/backups/<label>-<stamp>/."""
+    stamp = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
+    dest = os.path.join(proj.meta, 'backups', f'{re.sub(r"[^A-Za-z0-9._-]", "_", label)}-{stamp}')
+    for p, data in files.items():
+        full = os.path.join(dest, *p.split('/'))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'wb') as f:
+            f.write(data)
+    out(f'backed up {len(files)} local file(s) to {os.path.relpath(dest, proj.root)}')
+
+
+def git_can_follow(proj, target, in_looker):
+    """Before anything moves: refuse if the local git branch could not follow Looker to target."""
+    remote, g = proj.config['git_remote'], LocalGit(proj.root)
+    local = g.has_ref(f'refs/heads/{target}')
+    tracking = g.has_ref(f'refs/remotes/{remote}/{target}')
+    if not in_looker and local and not tracking:
+        raise Refused(f'branch {target!r} exists only in this clone; push it to the remote first '
+                      f'(git push -u {remote} {target}), then run switch again')
+    if in_looker and not (local or tracking):
+        raise Refused(f'branch {target!r} is in Looker but not in this clone, even after fetching '
+                      f'{remote!r}; push it from the Looker IDE, then run switch again')
+
+
+def git_stash(proj, env_flag):
+    """Stash a dirty work tree, never the tool's own files. Returns (from, stash name or None)."""
+    g = LocalGit(proj.root)
+    origin = g.branch() or g.short_head() or 'HEAD'
+    # Name only what git does not already ignore: an exclude pathspec naming an ignored path
+    # makes `git stash push` fail after saving, with the tree half cleaned (git 2.43).
+    own = own_paths(proj, env_flag)
+    own = [p for p in own if p not in g.ignored(own)]
+    if not g.dirty(exclude=own):
+        return origin, None
+    name = f'looker-sync {origin} {datetime.datetime.now().strftime("%Y%m%dT%H%M%S")}'
+    rc, _, err = g.run('stash', 'push', '--include-untracked', '-m', name, *pathspecs(own))
+    if rc:
+        raise Refused(f'git stash failed, so the local git branch was not moved: {err}')
+    out(f'git: stashed the uncommitted changes as {name!r}')
+    return origin, name
+
+
+def git_checkout(proj, sess, target):
+    """Check out target (from <remote>/target if new), then fast-forward to Looker's commit."""
+    remote, g = proj.config['git_remote'], LocalGit(proj.root)
+    if g.branch() != target:
+        if g.has_ref(f'refs/heads/{target}'):
+            rc, _, err = g.run('checkout', '--quiet', target)
+        else:
+            rc, _, err = g.run('checkout', '--quiet', '--track', '-b', target, f'{remote}/{target}')
+        if rc:
+            raise Refused(f'git checkout {target} failed: {err}')
+        out(f'git: checked out {target}')
+    ref, head = (getattr(sess, 'branch_info', None) or {}).get('ref'), g.head()
+    if not ref or ref == head:
+        return
+    if not g.has_commit(ref):
+        out(f"warning: Looker's commit {ref[:12]} is not in this clone (not pushed yet?); "
+            f'git branch {target!r} left where it is')
+    elif g.is_ancestor(ref, head):
+        out(f"warning: git branch {target!r} is ahead of {ref[:12]}, the commit Looker is on; left where it is")
+    elif not g.is_ancestor(head, ref):
+        out(f"warning: git branch {target!r} has diverged from {ref[:12]}, the commit Looker is on; "
+            'left where it is. git diff shows how the mirrored files differ.')
+    else:
+        rc, _, err = g.run('merge', '--ff-only', '--quiet', ref)
+        if rc:
+            out(f'warning: git merge --ff-only {ref[:12]} failed ({err}); git branch {target!r} left where it is')
+        else:
+            out(f'git: fast-forwarded {target} to {ref[:12]}, the commit Looker is on')
+
+
 def cmd_switch(proj, args):
     cfg = proj.require_config()
     interactive = sys.stdin.isatty()
+    if args.force:
+        args.local_changes, args.yes = 'backup', True
     sess = open_session(proj, args, check_branch=False)
+    linked = bool(cfg.get('git_remote'))
+    drift = git_drift(proj, sess) if linked else None
     target_mode = 'dev' if args.branch else args.mode
     if target_mode == 'dev' and sess.mode != 'dev':
         sess.set_mode('dev')
         sess.branch = sess.current_branch()
     target_branch = args.branch or (sess.branch if target_mode == 'dev' else None)
-    if target_mode == cfg['mode'] and (target_mode == 'prod' or target_branch == cfg.get('branch') == sess.branch):
+    git_to = git_target(sess, target_mode, target_branch) if linked else None
+    if (target_mode == cfg['mode'] and (target_mode == 'prod' or target_branch == cfg.get('branch') == sess.branch)
+            and (not linked or LocalGit(proj.root).branch() == git_to)):
         out(f'already on {target_mode} {target_branch or ""}; nothing to switch')
         return OK
     if args.branch:
         names = [b.get('name') for b in sess.L.call('GET', f'/projects/{cfg["project"]}/git_branches') or []]
         if args.branch not in names:
+            if linked:
+                git_can_follow(proj, args.branch, in_looker=False)
             raise Refused(f'branch {args.branch!r} does not exist in Looker; switch never creates branches')
+    if linked:
+        git_can_follow(proj, git_to, in_looker=True)
 
     def remote_guard():
         if cfg['mode'] != 'dev':
@@ -596,6 +1005,7 @@ def cmd_switch(proj, args):
     remote_guard()
     local = proj.local_files()
     known = proj.state.get('files', {})
+    label = (cfg.get('branch') if cfg['mode'] == 'dev' else 'production') or 'unknown'
     changed = [p for p in sorted(set(local) | set(known)) if sha(local.get(p)) != known.get(p)]
     if changed:
         out('local changes not pushed to Looker:')
@@ -611,24 +1021,20 @@ def cmd_switch(proj, args):
         if choice == 'push':
             if cfg['mode'] != 'dev':
                 raise Refused('cannot push from prod mode; use --local-changes backup or cancel')
+            if drift:
+                raise Refused(f'git is on {drift[1] or "a detached HEAD"}, not {drift[0]!r}, so these files '
+                              'belong to another branch; use --local-changes backup (a git stash) or cancel')
             do_push(proj, sess)
             remote_guard()
-        if choice == 'backup':
-            stamp = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
-            label = (cfg.get('branch') if cfg['mode'] == 'dev' else 'production') or 'unknown'
-            dest = os.path.join(proj.meta, 'backups', f'{re.sub(r"[^A-Za-z0-9._-]", "_", label)}-{stamp}')
-            for p, data in local.items():
-                full = os.path.join(dest, *p.split('/'))
-                os.makedirs(os.path.dirname(full), exist_ok=True)
-                with open(full, 'wb') as f:
-                    f.write(data)
-            out(f'backed up {len(local)} local file(s) to {os.path.relpath(dest, proj.root)}')
+        if choice == 'backup' and not linked:   # linked: the git stash below is the backup
+            backup_copy(proj, local, label)
 
     where = f'branch {target_branch}' if target_mode == 'dev' else 'production'
     if not args.yes:
         if not interactive:
             raise Refused(f'no terminal to confirm; pass --yes to switch to {where}')
-        if ask(f'Switch to {where}? This moves your Looker IDE too. [y/N]', ['yes', 'no']) != 'yes':
+        also = ' and the local git branch' if linked else ''
+        if ask(f'Switch to {where}? This moves your Looker IDE{also} too. [y/N]', ['yes', 'no']) != 'yes':
             raise Refused('cancelled; nothing changed')
 
     if target_mode == 'dev':
@@ -643,16 +1049,37 @@ def cmd_switch(proj, args):
         sess.set_mode('prod')
         sess.branch = sess.current_branch()
 
-    for p in local:
-        os.remove(os.path.join(proj.root, *p.split('/')))
+    stash = None
+    if linked:
+        origin, stash = git_stash(proj, args.env_file)
+        # what the stash could not take (git-ignored synced files) still gets the file copy
+        left = {p: d for p, d in proj.local_files().items() if local.get(p) == d and sha(d) != known.get(p)}
+        if left:
+            backup_copy(proj, left, label)
+        git_checkout(proj, sess, git_to)
+
+    old = proj.local_files()   # after the git checkout, which may already have changed the tree
+    for p in old:
+        try:
+            os.remove(os.path.join(proj.root, *p.split('/')))
+        except FileNotFoundError:
+            pass
     remote = sess.remote_files()
     for p, data in remote.items():
         proj.write_local(p, data)
+    back = f'--branch {cfg["branch"]}' if cfg['mode'] == 'dev' and cfg.get('branch') else '--mode prod'
     cfg.update({'mode': target_mode, 'branch': target_branch})
     proj.save_config()
     proj.state = {'files': {}}
     record(proj, sess, {p: sha(d) for p, d in remote.items()})
-    out(f'switched to {target_mode} ({where}); mirrored {len(remote)} file(s), removed {len(local)} old local file(s)')
+    out(f'switched to {target_mode} ({where}); mirrored {len(remote)} file(s), removed {len(old)} old local file(s)')
+    if stash:
+        if drift:   # the stash came off a branch the config was not on: point at that git branch
+            way = f'git checkout {origin} (pull and push refuse there until you switch back)'
+        else:
+            way = f'looker-sync switch {back} --force'
+        out(f'git: your uncommitted changes from {origin} are in the stash {stash!r}; looker-sync never pops it. '
+            f'To get them back: {way}, find it with git stash list, then git stash pop')
     return OK
 
 
@@ -704,6 +1131,11 @@ def main(argv=None):
     p.add_argument('--exclude', nargs='+')
     p.add_argument('--no-pull', action='store_true', help='write the metadata only')
     p.add_argument('--force', action='store_true', help="take Looker's copy over files already in the folder")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--git-remote', metavar='NAME', help='link to this git remote; refuse if it cannot be')
+    g.add_argument('--no-git', action='store_true', help='do not link the folder to git')
+    p = sub.add_parser('link', help='link this folder to a git remote of its clone')
+    p.add_argument('--remote', default='origin', help='the git remote name (default: origin)')
     p = sub.add_parser('pull', help='copy Looker files to disk; never deletes local files')
     p.add_argument('--force', action='store_true', help="take Looker's copy over unpushed local changes")
     p.add_argument('--dry-run', action='store_true')
@@ -716,8 +1148,10 @@ def main(argv=None):
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--branch')
     g.add_argument('--mode', choices=['dev', 'prod'])
-    p.add_argument('--local-changes', choices=['push', 'backup', 'cancel'],
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--local-changes', choices=['push', 'backup', 'cancel'],
                    help='what to do with unpushed local changes when there is no terminal')
+    g.add_argument('--force', action='store_true', help='= --local-changes backup --yes (a git stash when linked)')
     p.add_argument('--yes', action='store_true', help='confirm the switch without a terminal')
     p = sub.add_parser('skill', help='print the full usage guide written for agents')
     p.add_argument('--path', action='store_true', help='print where the guide file is instead')
@@ -726,7 +1160,7 @@ def main(argv=None):
         return cmd_skill(args)
     proj = Project(args.project_dir)
     try:
-        return {'init': cmd_init, 'pull': cmd_pull, 'status': cmd_status,
+        return {'init': cmd_init, 'link': cmd_link, 'pull': cmd_pull, 'status': cmd_status,
                 'push': cmd_push, 'switch': cmd_switch}[args.cmd](proj, args)
     except Refused as e:
         out(f'REFUSED: {e}')

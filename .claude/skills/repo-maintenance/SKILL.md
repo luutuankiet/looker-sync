@@ -27,7 +27,7 @@ Simply true, and expensive to re-derive.
 
 | page | summary | verified |
 |---|---|---|
-| [Looker file and branch API behaviour (live-verified)](../../../docs/reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-10-09 |
+| [Looker file and branch API behaviour (live-verified)](../../../docs/reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-10-24 |
 
 ## Decisions
 
@@ -36,6 +36,7 @@ it with a new one rather than editing it.
 
 - [The tool writes files and never touches git state](../../../docs/adr/0001-read-and-write-files-only.md)
 - [No commit command; ship on PyPI with the skill inside](../../../docs/adr/0002-no-commit-command-and-uvx-distribution.md)
+- [Never touch Looker's git state; touch a linked clone only through a narrow, checked scope](../../../docs/adr/0003-never-touch-lookers-git-and-a-narrow-local-git-scope.md)
 
 <!-- END GENERATED INDEX -->
 

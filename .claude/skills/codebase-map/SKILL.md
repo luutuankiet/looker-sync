@@ -17,7 +17,7 @@ something is implemented.
 
 | page | covers | verified |
 |---|---|---|
-| [Sync model and guards](../../../docs/architecture/sync-model-and-guards.md) | how pull, push, status and switch decide what to write, which guard refuses what, and where in looker_sync.py each lives | 2026-10-09 |
+| [Sync model and guards](../../../docs/architecture/sync-model-and-guards.md) | how pull, push, status and switch decide what to write, which guard refuses what, and where in looker_sync.py each lives | 2026-10-24 |
 
 <!-- END GENERATED INDEX -->
 
