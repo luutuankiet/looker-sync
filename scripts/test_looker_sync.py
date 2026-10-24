@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import pty
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -365,9 +366,9 @@ class FakeLookerTestCase(unittest.TestCase):
         self.fake.server.server_close()
         self.tmp.cleanup()
 
-    def run_cli(self, *args):
+    def run_cli(self, *args, env=None):
         r = subprocess.run([sys.executable, CLI, '-C', self.dir, *args], capture_output=True,
-                           text=True, stdin=subprocess.DEVNULL, timeout=60)
+                           text=True, stdin=subprocess.DEVNULL, timeout=60, env=env)
         self.assertNotIn(SECRET, r.stdout + r.stderr)
         return r
 
@@ -751,6 +752,264 @@ class GitHarnessTest(GitTestCase):
         r = self.run_cli('switch', '--branch', 'review', '--yes')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(self.looker_get(f'/projects/{PROJECT}/git_branch')['is_local'])
+
+
+class GitLinkTest(GitTestCase):
+    """link, the init offer and the commit check: one user story per test."""
+
+    LOOKER_URL = GIT_REMOTE_SHAPES['remote'][1]
+
+    def setUp(self):
+        super().setUp()
+        # the CLI appends one JSON line per git call here (see run_git in cli.py)
+        self.git_log_path = os.path.join(self.tmp.name, 'git-calls.jsonl')
+        os.environ['LOOKER_SYNC_GIT_LOG'] = self.git_log_path
+
+    def git_calls(self):
+        if not os.path.exists(self.git_log_path):
+            return []
+        with open(self.git_log_path) as f:
+            return [json.loads(line)['args'] for line in f]
+
+    def config(self):
+        return json.loads(self.local('.looker-sync/config.json'))
+
+    def init_unlinked(self):
+        r = self.run_cli('init', '--project', PROJECT, '--branch', 'feat', '--no-git')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def link(self, *args):
+        r = self.run_cli('link', *args)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def on_terminal(self, args, answers):
+        master, slave = pty.openpty()
+        p = subprocess.Popen([sys.executable, CLI, '-C', self.dir, *args],
+                             stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        os.write(master, answers.encode())
+        chunks = b''
+        while True:
+            try:
+                data = os.read(master, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            chunks += data
+        os.close(master)
+        text = chunks.decode(errors='replace')
+        self.assertEqual(p.wait(timeout=60), 0, text)
+        self.assertNotIn(SECRET, text)
+        return text
+
+    def reclone_from_another_repository(self):
+        """Replace the project folder with a clone of an unrelated repository (same .env)."""
+        src, other = os.path.join(self.tmp.name, 'other-src'), os.path.join(self.tmp.name, 'other.git')
+        GitRepos.git('init', '-q', src)
+        with open(os.path.join(src, 'README.md'), 'w') as f:
+            f.write('an unrelated repository\n')
+        GitRepos.git('-C', src, 'add', '-A')
+        GitRepos.git('-C', src, 'commit', '-q', '-m', 'unrelated')
+        GitRepos.git('clone', '-q', '--bare', src, other)
+        with open(os.path.join(self.dir, '.env')) as f:
+            env = f.read()
+        shutil.rmtree(self.dir)
+        GitRepos.git('clone', '-q', other, self.dir)
+        with open(os.path.join(self.dir, '.env'), 'w') as f:
+            f.write(env)
+        return other
+
+    # ---- link
+
+    def test_link_on_a_matching_clone_writes_git_remote(self):
+        self.fake.set_git_remote('https')   # the protocol Looker uses does not matter
+        self.init_unlinked()
+        self.assertNotIn('git_remote', self.config())
+        r = self.link()
+        self.assertIn("linked to git remote 'origin'", r.stdout)
+        self.assertEqual(self.config()['git_remote'], 'origin')
+        self.assertIn(['fetch', '--quiet', 'origin'], self.git_calls())
+        # every git call went through the one runner, and only reads and fetch were run
+        reads = {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base', 'remote', 'fetch'}
+        self.assertTrue(self.git_calls())
+        self.assertEqual({a[0] for a in self.git_calls()} - reads, set())
+        self.assertEqual(self.run_cli('status').returncode, 0)
+
+    def test_link_refuses_projects_with_nothing_to_clone(self):
+        self.init_unlinked()
+        cases = [('none', None, 'does not use git'),
+                 ('bare', None, 'Looker-hosted bare repository'),
+                 ('remote', 'null', 'no remote repository')]
+        for shape, url, reason in cases:
+            with self.subTest(shape=shape, url=url):
+                self.fake.set_git_remote(shape)
+                if url == 'null':
+                    self.fake.project_git['git_remote_url'] = None
+                r = self.run_cli('link')
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIn(reason, r.stdout)
+                self.assertNotIn('git_remote', self.config())
+
+    def test_link_refuses_a_remote_name_that_does_not_exist(self):
+        self.init_unlinked()
+        r = self.run_cli('link', '--remote', 'upstream')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("no git remote named 'upstream'", r.stdout)
+        self.assertNotIn('git_remote', self.config())
+
+    def test_link_refuses_a_clone_of_another_repository_showing_both_urls(self):
+        other = self.reclone_from_another_repository()
+        self.init_unlinked()
+        r = self.run_cli('link')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        line_looker = next(l for l in r.stdout.splitlines() if self.LOOKER_URL in l)
+        line_local = next(l for l in r.stdout.splitlines() if other in l)
+        self.assertIn("Looker's remote", line_looker)
+        self.assertIn("remote 'origin'", line_local)
+        self.assertNotIn('git_remote', self.config())
+
+    def test_link_refuses_outside_a_git_work_tree(self):
+        self.init_unlinked()
+        shutil.rmtree(os.path.join(self.dir, '.git'))
+        r = self.run_cli('link')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn('not a git work tree', r.stdout)
+
+    # ---- the commit check
+
+    def test_commit_check_falls_back_to_remote_ref_then_warns_when_looker_is_ahead(self):
+        self.init_unlinked()
+        # Looker committed without pushing: ref is not in the clone, remote_ref is
+        files = dict(self.fake.branches['feat'], **{'views/a.view.lkml': 'view: a {}\n'})
+        first = self.repos.commit('feat', files, push=False)
+        r = self.link()
+        self.assertNotIn('warning', r.stdout)
+        # neither ref nor remote_ref is in the clone (Looker's idea of its remote is stale), and
+        # Looker reports unpushed commits: a valid link, so warn instead of refusing
+        self.repos.commit('feat', dict(files, **{'views/b.view.lkml': 'view: b {}\n'}), push=False)
+        self.fake.branch_git['feat']['remote_ref'] = first
+        self.assertEqual(self.fake.branch_resource('feat')['ahead_count'], 2)
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('warning', r.stdout)
+        self.assertIn('2 commit(s) Looker has not pushed', r.stdout)
+
+    def test_every_command_in_a_linked_folder_fetches_and_runs_the_commit_check(self):
+        self.init_unlinked()
+        self.link()
+        # Looker moves on and pushes: the next command fetches, so the new commit is found
+        sha = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'views/n.view.lkml': 'view: n {}\n'}))
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(self.git_try('cat-file', '-e', sha + '^{commit}').returncode, 0)
+        # Looker's commits are nowhere in the clone and Looker is not ahead: refuse everywhere
+        stray = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'x.view.lkml': 'view: x {}\n'}), push=False)
+        self.fake.branch_git['feat'].update(remote_ref=stray, ahead_count=0)
+        for args in (['status'], ['pull'], ['push'], ['switch', '--branch', 'master', '--yes']):
+            with self.subTest(args=args):
+                before = len(self.writes())
+                r = self.run_cli(*args)
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIn(stray[:12], r.stdout)
+                self.assertIn(self.LOOKER_URL, r.stdout)
+                self.assertIn(self.repos.remote, r.stdout)
+                self.assertEqual(len(self.writes()), before)
+        self.assertEqual(self.fake.dev_branch, 'feat')
+
+    def test_fetch_failure_warns_and_the_command_continues(self):
+        self.init_unlinked()
+        self.link()
+        self.git('remote', 'set-url', 'origin', os.path.join(self.tmp.name, 'gone.git'))
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('warning: git fetch origin failed', r.stdout)
+        self.assertIn('status:', r.stdout)
+
+    # ---- no link, no git
+
+    def test_without_git_remote_no_git_process_is_ever_spawned(self):
+        shim = os.path.join(self.tmp.name, 'shim')
+        os.makedirs(shim)
+        spawned = os.path.join(self.tmp.name, 'shim-calls')
+        with open(os.path.join(shim, 'git'), 'w') as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {spawned}\nexit 97\n')
+        os.chmod(os.path.join(shim, 'git'), 0o755)
+        env = dict(os.environ, PATH=shim + os.pathsep + os.environ['PATH'])
+        steps = [['init', '--project', PROJECT, '--branch', 'feat', '--no-git'], ['status'], ['pull'],
+                 ['switch', '--branch', 'master', '--yes'], ['switch', '--branch', 'feat', '--yes'],
+                 'edit', ['push'], ['status']]
+        for step in steps:
+            if step == 'edit':
+                self.put_local('views/orders.view.lkml', 'view: orders { # edit\n}\n')
+                continue
+            r = self.run_cli(*step, env=env)
+            self.assertEqual(r.returncode, 0, step + [r.stdout])
+        # a folder that is not a git work tree: init's default spawns no git either
+        blank = os.path.join(self.tmp.name, 'blank')
+        os.makedirs(blank)
+        r = subprocess.run([sys.executable, CLI, '-C', blank, '--env-file', os.path.join(self.dir, '.env'),
+                            'init', '--project', PROJECT], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=60, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn('git', [l.split(':')[0] for l in r.stdout.splitlines()])
+        self.assertFalse(os.path.exists(spawned), 'git was spawned')
+        self.assertEqual(self.git_calls(), [])
+
+    # ---- the init offer
+
+    def test_init_in_a_git_clone_without_a_terminal_links_origin_and_says_so(self):
+        r = self.init()
+        self.assertIn("git: linked to git remote 'origin'", r.stdout)
+        self.assertIn('--no-git', r.stdout)
+        self.assertEqual(self.config()['git_remote'], 'origin')
+        self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders {}\n')
+
+    def test_init_no_git_says_it_did_not_link(self):
+        r = self.init_unlinked()
+        self.assertIn('git: not linked (--no-git)', r.stdout)
+        self.assertIn('looker-sync link', r.stdout)
+        self.assertEqual(self.git_calls(), [])
+
+    def test_init_default_on_an_ineligible_project_continues_unlinked_with_the_reason(self):
+        self.fake.set_git_remote('bare')
+        r = self.init()
+        self.assertIn('git: not linked', r.stdout)
+        self.assertIn('Looker-hosted bare repository', r.stdout)
+        self.assertNotIn('git_remote', self.config())
+        self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders {}\n')
+
+    def test_init_default_on_a_clone_of_another_repository_continues_unlinked_showing_both_urls(self):
+        other = self.reclone_from_another_repository()
+        r = self.init()
+        self.assertIn('git: not linked', r.stdout)
+        self.assertIn(self.LOOKER_URL, r.stdout)
+        self.assertIn(other, r.stdout)
+        self.assertNotIn('git_remote', self.config())
+
+    def test_init_with_an_explicit_git_remote_refuses_when_it_cannot_link(self):
+        r = self.run_cli('init', '--project', PROJECT, '--branch', 'feat', '--git-remote', 'upstream')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("no git remote named 'upstream'", r.stdout)
+        self.assertNotIn('git_remote', self.config())
+        self.git('remote', 'add', 'upstream', self.repos.remote)
+        r = self.run_cli('init', '--project', PROJECT, '--branch', 'feat', '--git-remote', 'upstream')
+        self.assertEqual(r.returncode, 0, r.stdout)   # init resumes and links
+        self.assertEqual(self.config()['git_remote'], 'upstream')
+
+    def test_init_on_a_terminal_offers_the_link(self):
+        text = self.on_terminal(['init', '--project', PROJECT, '--branch', 'feat'], '\ny\n')
+        self.assertIn('Link this folder', text)
+        self.assertEqual(self.config()['git_remote'], 'origin')
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, 'models', 'demo.model.lkml')))
+
+    def test_init_on_a_terminal_can_decline_the_link(self):
+        text = self.on_terminal(['init', '--project', PROJECT, '--branch', 'feat'], 'n\ny\n')
+        self.assertIn('git: not linked', text)
+        self.assertNotIn('git_remote', self.config())
+        self.assertNotIn(['fetch', '--quiet', 'origin'], self.git_calls())
 
 
 if __name__ == '__main__':
