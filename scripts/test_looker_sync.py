@@ -958,6 +958,10 @@ class GitLinkTest(GitTestCase):
                            stdin=subprocess.DEVNULL, timeout=60, env=env)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertNotIn('git', [l.split(':')[0] for l in r.stdout.splitlines()])
+        # the read-only push guard reads Looker only
+        self.fake.readonly.add('feat')
+        self.put_local('views/orders.view.lkml', 'view: orders { # again\n}\n')
+        self.assertEqual(self.run_cli('push', env=env).returncode, 2)
         self.assertFalse(os.path.exists(spawned), 'git was spawned')
         self.assertEqual(self.git_calls(), [])
 
@@ -1230,6 +1234,131 @@ class GitSwitchTest(GitTestCase):
                                                    'remote', 'fetch', 'stash', 'checkout', 'merge'}, set())
         self.assertEqual(len(self.stashes()), 1)   # never popped
         # the tearDown check asserts the never-list on every test of this class
+
+
+class GitDriftTest(GitTestCase):
+    """The drift guard: status warns, pull and push refuse while git is off the config branch."""
+
+    FIX = 'looker-sync switch --branch feat --force'
+
+    def setUp(self):
+        super().setUp()
+        r = self.init()   # a clone without a terminal: init links origin
+        self.assertEqual(self.config()['git_remote'], 'origin', r.stdout)
+
+    def tearDown(self):
+        try:
+            self.assertEqual([a for a in self.git_calls() if a[0] in GitSwitchTest.NEVER], [])
+        finally:
+            super().tearDown()
+
+    def snapshot(self):
+        """Every file in the folder outside .git, with its bytes."""
+        files = {}
+        for top, dirs, names in os.walk(self.dir):
+            dirs[:] = [d for d in dirs if d != '.git']
+            for n in names:
+                with open(os.path.join(top, n), 'rb') as f:
+                    files[os.path.relpath(os.path.join(top, n), self.dir)] = f.read()
+        return files
+
+    def make_work_on_both_sides(self):
+        """A pull and a push that would each write something if they were let through."""
+        self.repos.commit('feat', dict(self.fake.branches['feat'], **{'views/looker.view.lkml': 'view: looker {}\n'}))
+        self.put_local('views/mine.view.lkml', 'view: mine {}\n')
+
+    def git_moves(self):
+        return [a for a in self.git_calls() if a[0] in ('checkout', 'stash', 'merge')]
+
+    def assert_refused_untouched(self, args, fix):
+        before, writes, moves = self.snapshot(), len(self.writes()), self.git_moves()
+        r = self.run_cli(*args)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn(fix, [line.strip() for line in r.stdout.splitlines()])
+        self.assertEqual((len(self.writes()), self.git_moves()), (writes, moves))
+        self.assertEqual(self.snapshot(), before)
+        return r
+
+    def test_status_warns_after_a_hand_made_checkout_and_writes_nothing(self):
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')   # by hand
+        before = self.snapshot()
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("warning: git is on 'master', not 'feat'", r.stdout)
+        self.assertIn(self.FIX, [line.strip() for line in r.stdout.splitlines()])
+        self.assertIn('status:', r.stdout)
+        self.assertEqual((self.writes(), self.git_moves()), ([], []))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_pull_and_push_refuse_after_a_hand_made_checkout_until_switch_fixes_it(self):
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')
+        self.make_work_on_both_sides()
+        for args in (['pull'], ['pull', '--force'], ['push'], ['push', '--force', '--delete']):
+            with self.subTest(args=args):
+                r = self.assert_refused_untouched(args, self.FIX)
+                self.assertIn("git is on 'master', not 'feat'", r.stdout)
+        self.assertEqual(self.git('branch', '--show-current'), 'master')
+        # the fix line does what it says; afterwards pull goes through
+        os.remove(os.path.join(self.dir, 'views/mine.view.lkml'))
+        self.assertEqual(self.run_cli('switch', '--branch', 'feat', '--force').returncode, 0)
+        r = self.run_cli('pull')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn('warning: git', r.stdout)
+        self.assertEqual(self.local('views/looker.view.lkml'), 'view: looker {}\n')
+
+    def test_detached_head_is_drift(self):
+        self.git('checkout', '-q', '--detach')   # same commit, but not a branch
+        self.make_work_on_both_sides()
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("warning: git is on a detached HEAD, not 'feat'", r.stdout)
+        for args in (['pull'], ['push']):
+            with self.subTest(args=args):
+                r = self.assert_refused_untouched(args, self.FIX)
+                self.assertIn("git is on a detached HEAD, not 'feat'", r.stdout)
+
+    def test_in_prod_mode_the_fix_line_names_prod(self):
+        self.assertEqual(self.run_cli('switch', '--mode', 'prod', '--force').returncode, 0)
+        self.git('checkout', '-q', 'feat')
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("warning: git is on 'feat', not 'master'", r.stdout)
+        r = self.assert_refused_untouched(['pull'], 'looker-sync switch --mode prod --force')
+
+    def test_no_drift_no_warning(self):
+        for args in (['status'], ['pull'], ['push']):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertNotIn('warning: git', r.stdout)
+
+    def test_push_on_a_readonly_branch_is_refused_while_status_and_pull_still_work(self):
+        self.fake.readonly.add('feat')   # as a colleague's personal branch would be
+        self.make_work_on_both_sides()
+        before, writes = self.snapshot(), len(self.writes())
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("Looker reports branch 'feat' as read-only for you", r.stdout)
+        self.assertEqual((len(self.writes()), self.snapshot()), (writes, before))
+        self.assertEqual(self.run_cli('status').returncode, 0)
+        self.assertEqual(self.run_cli('pull').returncode, 0)
+
+    def test_unlinked_folder_never_checks_drift_but_still_refuses_a_readonly_push(self):
+        cfg = self.config()
+        del cfg['git_remote']
+        self.put_local('.looker-sync/config.json', json.dumps(cfg))
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')   # drift, but nothing is linked
+        os.remove(self.git_log_path)
+        for args in (['status'], ['pull'], ['push']):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertNotIn('warning: git', r.stdout)
+            self.assertNotIn('switch --branch', r.stdout)
+        self.fake.readonly.add('feat')
+        self.put_local('views/mine.view.lkml', 'view: mine {}\n')
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn('read-only', r.stdout)
+        self.assertEqual(self.git_calls(), [])
 
 
 if __name__ == '__main__':

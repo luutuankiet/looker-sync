@@ -383,6 +383,23 @@ def git_drift(proj, sess):
     return None if actual == expected else (expected, actual)
 
 
+def drift_guard(proj, sess, cmd, refuse):
+    """In a linked folder off the expected branch: status warns (refuse False); pull and push
+    refuse, so one branch's files never land on another branch's checkout. Both print the fix."""
+    drift = git_drift(proj, sess)
+    if not drift:
+        return
+    expected, actual = drift
+    cfg = proj.require_config()
+    where = f'{actual!r}' if actual else 'a detached HEAD'
+    fix = f'looker-sync switch --branch {cfg["branch"]} --force' if cfg['mode'] == 'dev' else \
+        'looker-sync switch --mode prod --force'
+    if refuse:
+        raise Refused(f'git is on {where}, not {expected!r}, so {cmd} would sync one branch\'s files '
+                      f'with another branch\'s checkout. Put git back on {expected!r} with:\n    {fix}')
+    out(f'warning: git is on {where}, not {expected!r}; pull and push refuse until it is back. Fix:\n    {fix}')
+
+
 # A real remote is a URL with a scheme or scp-like `user@host:path`. Anything else Looker
 # reports (live: a relative path into its own bare-model store) is a Looker-hosted repository.
 REMOTE_URL = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://|[^/\s@:]+@[^/\s:]+:')
@@ -779,11 +796,14 @@ def cmd_link(proj, args):
 
 
 def cmd_pull(proj, args):
-    return do_pull(proj, open_session(proj, args), args.force, args.dry_run)
+    sess = open_session(proj, args)
+    drift_guard(proj, sess, 'pull', refuse=True)
+    return do_pull(proj, sess, args.force, args.dry_run)
 
 
 def cmd_status(proj, args):
     sess = open_session(proj, args)
+    drift_guard(proj, sess, 'status', refuse=False)
     kinds = plan(proj.local_files(), sess.remote_files(), proj.state.get('files', {}))
     show(kinds, 'status')
     info = getattr(sess, 'branch_info', None) or {}
@@ -798,6 +818,10 @@ def cmd_status(proj, args):
 def do_push(proj, sess, force=False, delete=False, dry_run=False):
     if sess.mode != 'dev':
         raise Refused('push is refused in prod mode; switch --mode dev first')
+    # Not verified live with two users: the flag is what the branch resource reports.
+    if (getattr(sess, 'branch_info', None) or {}).get('readonly'):
+        raise Refused(f'Looker reports branch {sess.branch!r} as read-only for you, as a colleague\'s '
+                      'personal branch is; review it, then switch to a branch of your own to push')
     local, remote = proj.local_files(), sess.remote_files()
     kinds = plan(local, remote, proj.state.get('files', {}))
     show(kinds, 'push plan')
@@ -855,7 +879,9 @@ def do_push(proj, sess, force=False, delete=False, dry_run=False):
 
 
 def cmd_push(proj, args):
-    return do_push(proj, open_session(proj, args), args.force, args.delete, args.dry_run)
+    sess = open_session(proj, args)
+    drift_guard(proj, sess, 'push', refuse=True)
+    return do_push(proj, sess, args.force, args.delete, args.dry_run)
 
 
 def ask(question, choices):
