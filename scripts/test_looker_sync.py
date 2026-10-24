@@ -851,7 +851,7 @@ class GitLinkTest(GitTestCase):
         self.assertEqual(self.config()['git_remote'], 'origin')
         self.assertIn(['fetch', '--quiet', 'origin'], self.git_calls())
         # every git call went through the one runner, and only reads and fetch were run
-        reads = {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base', 'remote', 'fetch'}
+        reads = {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base', 'remote', 'fetch', 'for-each-ref'}
         self.assertTrue(self.git_calls())
         self.assertEqual({a[0] for a in self.git_calls()} - reads, set())
         self.assertEqual(self.run_cli('status').returncode, 0)
@@ -945,6 +945,64 @@ class GitLinkTest(GitTestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn('warning: git fetch origin failed', r.stdout)
         self.assertIn('status:', r.stdout)
+
+    def test_a_second_remote_without_lookers_commit_refuses_even_though_the_clone_has_it(self):
+        # a fork copied before Looker's next commit: same history, but it lacks that commit
+        fork = os.path.join(self.tmp.name, 'fork.git')
+        GitRepos.git('clone', '-q', '--bare', self.repos.remote, fork)
+        self.init_unlinked()
+        sha = self.repos.commit('feat', dict(self.fake.branches['feat'], **{'views/n.view.lkml': 'view: n {}\n'}))
+        self.git('fetch', '-q', 'origin')
+        self.git('remote', 'add', 'fork', fork)
+        self.assertEqual(self.git_try('cat-file', '-e', sha + '^{commit}').returncode, 0)
+        # the commit is in the clone (from origin), so only "which remote has it" can refuse
+        r = self.run_cli('link', '--remote', 'fork')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn(sha[:12], r.stdout)
+        line_looker = next(l for l in r.stdout.splitlines() if self.LOOKER_URL in l)
+        line_local = next(l for l in r.stdout.splitlines() if fork in l)
+        self.assertIn("Looker's remote", line_looker)
+        self.assertIn("remote 'fork'", line_local)
+        self.assertNotIn('git_remote', self.config())
+        # the remote that has the commit still links, with a second remote present
+        r = self.link('--remote', 'origin')
+        self.assertNotIn('warning', r.stdout)
+        self.assertEqual(self.config()['git_remote'], 'origin')
+        calls = self.git_calls()
+        self.assertTrue(any(a[0] == 'for-each-ref' and a[-1] == 'refs/remotes/origin/' for a in calls))
+        self.assertTrue(any(a[0] == 'for-each-ref' and a[-1] == 'refs/remotes/fork/' for a in calls))
+        self.assertEqual({a[0] for a in calls} - {'rev-parse', 'symbolic-ref', 'status', 'cat-file',
+                                                   'merge-base', 'remote', 'fetch', 'for-each-ref'}, set())
+        # a linked folder whose remote stops having Looker's commit refuses on every command
+        self.git('remote', 'set-url', 'origin', fork)
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn(fork, r.stdout)
+
+    def test_the_containment_read_is_the_only_new_git_form_and_write_forms_stay_refused(self):
+        probe = ('import json, sys\n'
+                 'from looker_sync.cli import run_git\n'
+                 'for args in json.loads(sys.argv[2]):\n'
+                 '    try:\n'
+                 '        rc, _, _ = run_git(sys.argv[1], *args)\n'
+                 '        print("ran", rc)\n'
+                 '    except RuntimeError:\n'
+                 '        print("refused")\n')
+        forms = [['for-each-ref', '--count=1', '--format=%(refname)', '--contains', 'HEAD', 'refs/remotes/origin/'],
+                 ['for-each-ref', '--format=%(refname)', 'refs/'],
+                 ['branch', '-r', '--contains', 'HEAD'],
+                 ['branch', '-D', 'feat'],
+                 ['update-ref', 'refs/heads/x', 'HEAD'],
+                 ['remote', 'add', 'x', 'y'],
+                 ['tag', 'x']]
+        env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(CLI), '..', 'src'))
+        r = subprocess.run([sys.executable, '-c', probe, self.dir, json.dumps(forms)],
+                           capture_output=True, text=True, timeout=60, env=env, cwd=self.tmp.name)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), ['ran 0'] + ['refused'] * 6)
+        # a refused form never starts a git process: only the read is in the call log
+        self.assertEqual(self.git_calls(), [forms[0]])
+        self.assertEqual(self.git('branch', '--list', 'x'), '')
 
     # ---- no link, no git
 
@@ -1278,7 +1336,8 @@ class GitSwitchTest(GitTestCase):
         self.assertTrue(any(a[0] == 'stash' for a in calls))
         self.assertTrue(any(a[0] == 'checkout' for a in calls))
         self.assertEqual({a[0] for a in calls} - {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base',
-                                                   'remote', 'fetch', 'stash', 'checkout', 'merge'}, set())
+                                                   'remote', 'fetch', 'stash', 'checkout', 'merge',
+                                                   'for-each-ref'}, set())
         self.assertEqual(len(self.stashes()), 1)   # never popped
         # the tearDown check asserts the never-list on every test of this class
 
