@@ -819,7 +819,8 @@ def cmd_status(proj, args):
 def do_push(proj, sess, force=False, delete=False, dry_run=False):
     if sess.mode != 'dev':
         raise Refused('push is refused in prod mode; switch --mode dev first')
-    # Not verified live with two users: the flag is what the branch resource reports.
+    # Not verified live with two users (a non-admin cannot see a project with no model in
+    # production, and the sandbox has none): the flag is what the branch resource reports.
     if (getattr(sess, 'branch_info', None) or {}).get('readonly'):
         raise Refused(f'Looker reports branch {sess.branch!r} as read-only for you, as a colleague\'s '
                       'personal branch is; review it, then switch to a branch of your own to push')

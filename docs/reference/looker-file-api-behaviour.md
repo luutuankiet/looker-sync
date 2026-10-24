@@ -66,3 +66,44 @@ by name answers 200 (seen during the design probe).
 **Not verified live:** the exact spelling of the bare-model path, `git_service_name` for the
 bare and no-git shapes, the other fields of a remote-only branch, and `readonly` on a
 colleague's personal branch (needs two users).
+
+## Remote-only branches, bare repositories and two users (verified 2026-10-24)
+
+Closes most of the list above. Sandbox project, dev mode, two throwaway branches pushed with
+plain git one commit ahead of a local tracking branch in the clone.
+
+**A remote-only branch** (pushed with git, never checked out in Looker) is listed with
+`is_local: false, is_remote: true, ref: "", remote_ref: <remote tip>, ahead_count: null,
+behind_count: null, personal: false, readonly: false, is_production: false, error: "",
+message: ""` and an int `commit_at`.
+
+**Right after the first checkout** (`PUT /projects/{id}/git_branch {"name": ...}`, 200), the
+singular `GET /projects/{id}/git_branch` still answers `is_local: false, ref: ""` with null
+counts, while `git_branches` already lists the branch `is_local: true, ref: <remote tip>,
+ahead_count: 0`. A few seconds later the singular answer catches up. Code that reads `ref` from
+the singular resource must fall back to `remote_ref`; `switch` does since this fix, and before
+it skipped the fast-forward silently.
+
+**The fast-forward in `switch`** runs live: with the local branch one commit behind the commit
+Looker is on, `switch --branch <it>` ran `merge-base --is-ancestor` both ways, then
+`merge --ff-only --quiet <commit>` (exit 0) and printed `git: fast-forwarded ...`. Seen both
+on a second checkout and, after the fix, on a first checkout of a remote-only branch.
+
+**After one first checkout** Looker reported every file of the branch as uncommitted
+(`git_status: {"action": "add", "text": "Modified", "revertable": false}`) although the content
+matched the commit, so `switch` refused to leave it. `POST /projects/{id}/reset_to_remote` on
+that throwaway branch cleared it. Seen once in two first checkouts; cause unknown.
+
+**`git_remote_url` shapes**, read over every project of the instance: a Looker-hosted bare
+repository is `../../bare_models/<project id>.git` with `uses_git: true` and
+`git_service_name: null`; a project without git has `uses_git: false`, `git_remote_url: null`,
+`git_service_name: null`. Real remotes name the service (`github`, `bitbucket`).
+
+**Two users: not verified.** A non-admin user (permissions `access_data`, `develop`,
+`see_lookml` on the all-access model set) gets 404 on `/projects/{id}` and its branches for a
+project with no model deployed in production, even with a model configuration pointing at it;
+every project such a user could see had a model. The sandbox project has none, and deploying
+one means writing to production. So `readonly` on a colleague's personal branch, and `push`
+refusing it, still rest on the field the branch resource reports. A new user on this instance
+also could not get API3 credentials (`POST /users/{id}/credentials_api3` answered 404); admin
+sudo (`POST /login/{user_id}`) worked.
