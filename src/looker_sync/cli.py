@@ -749,6 +749,7 @@ def cmd_init(proj, args):
     if interactive() and (prompt_text('Pull the project files into this folder now? (y/n)', 'y') or 'y').lower() != 'y':
         out('skipped the first pull; run: looker-sync pull')
         return OK
+    drift_guard(proj, sess, 'pull', refuse=True)   # a clone off Looker's branch: link, then refuse
     return do_pull(proj, sess, args.force)
 
 
@@ -1073,8 +1074,12 @@ def cmd_switch(proj, args):
     record(proj, sess, {p: sha(d) for p, d in remote.items()})
     out(f'switched to {target_mode} ({where}); mirrored {len(remote)} file(s), removed {len(old)} old local file(s)')
     if stash:
+        if drift:   # the stash came off a branch the config was not on: point at that git branch
+            way = f'git checkout {origin} (pull and push refuse there until you switch back)'
+        else:
+            way = f'looker-sync switch {back} --force'
         out(f'git: your uncommitted changes from {origin} are in the stash {stash!r}; looker-sync never pops it. '
-            f'To get them back: looker-sync switch {back} --force, find it with git stash list, then git stash pop')
+            f'To get them back: {way}, find it with git stash list, then git stash pop')
     return OK
 
 

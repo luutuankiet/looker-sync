@@ -974,6 +974,16 @@ class GitLinkTest(GitTestCase):
         self.assertEqual(self.config()['git_remote'], 'origin')
         self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders {}\n')
 
+    def test_init_on_a_clone_off_the_looker_branch_links_but_its_first_pull_hits_the_drift_guard(self):
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')   # the clone is not on Looker's branch
+        r = self.run_cli('init', '--project', PROJECT, '--branch', 'feat')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self.config()['git_remote'], 'origin')
+        self.assertIn('looker-sync switch --branch feat --force', r.stdout)
+        # nothing of feat was written onto master's checkout
+        self.assertEqual(self.git('status', '--porcelain', '--', '.', ':(exclude).looker-sync', ':(exclude).env',
+                                  ':(exclude).gitignore'), '')
+
     def test_init_no_git_says_it_did_not_link(self):
         r = self.init_unlinked()
         self.assertIn('git: not linked (--no-git)', r.stdout)
@@ -1173,6 +1183,15 @@ class GitSwitchTest(GitTestCase):
         self.switch('--mode', 'dev', '--force')
         self.assertEqual(self.head(), 'feat')
         self.assertEqual(self.local('views/orders.view.lkml'), 'view: orders {}\n')
+
+    def test_a_stash_taken_off_a_drifted_branch_points_back_to_that_git_branch(self):
+        self.git('checkout', '-q', '-b', 'master', 'origin/master')   # by hand, behind looker-sync's back
+        self.put_local('notes.txt', 'my notes\n')
+        r = self.switch('--branch', 'feat', '--force')
+        [stash] = self.stashes()
+        self.assertRegex(stash, r'^looker-sync master ')
+        self.assertIn('git checkout master', r.stdout)
+        self.assertNotIn('looker-sync switch --branch feat --force, find', r.stdout)
 
     def test_git_drift_is_fixed_by_switch_instead_of_nothing_to_do(self):
         self.git('checkout', '-q', '-b', 'master', 'origin/master')   # by hand, behind looker-sync's back
