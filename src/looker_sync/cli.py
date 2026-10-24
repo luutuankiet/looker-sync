@@ -233,7 +233,7 @@ class Project:
 # {"args": [...], "cwd": "...", "rc": N}. Tests read it to assert which git commands ran. It
 # records arguments and exit codes only, never git's output.
 
-GIT_READS = {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base', 'remote'}
+GIT_READS = {'rev-parse', 'symbolic-ref', 'status', 'cat-file', 'merge-base', 'remote', 'for-each-ref'}
 GIT_ALLOWED = GIT_READS | {'fetch', 'stash', 'checkout', 'merge'}
 
 
@@ -243,6 +243,8 @@ def git_in_scope(args):
         return False
     if cmd == 'remote':
         return args[1:2] == ['get-url']
+    if cmd == 'for-each-ref':
+        return '--contains' in args   # only the commit check's containment read
     if cmd == 'stash':
         return args[1:2] == ['push']
     if cmd == 'merge':
@@ -332,6 +334,14 @@ class LocalGit:
         if not sha or not re.fullmatch(r'[0-9a-f]{4,64}', sha):
             return False
         return self.run('cat-file', '-e', sha + '^{commit}')[0] == 0
+
+    def on_remote(self, sha, remote):
+        """True when commit sha is reachable from a ref under refs/remotes/<remote>/ (as last fetched)."""
+        if not sha or not re.fullmatch(r'[0-9a-f]{4,64}', sha):
+            return False
+        rc, stdout, _ = self.run('for-each-ref', '--count=1', '--format=%(refname)', '--contains', sha,
+                                 f'refs/remotes/{remote}/')
+        return rc == 0 and bool(stdout)
 
     def is_ancestor(self, a, b):
         return self.run('merge-base', '--is-ancestor', a, b)[0] == 0
@@ -425,11 +435,13 @@ def not_linkable(info, project):
 
 
 def commit_check(proj, sess, remote):
-    """Prove the clone and the Looker project are one repository: Looker's commit is local.
+    """Prove the linked remote and the Looker project are one repository: the remote has Looker's commit.
 
     Fetch first (a failure only warns). Then Looker's `ref`, else `remote_ref`, must exist in
-    the clone. If neither does and Looker reports unpushed commits, warn; otherwise refuse,
-    printing both remote URLs. No URL is ever compared. Returns the local remote's URL.
+    the clone AND be reachable from a ref under refs/remotes/<remote>/, so a commit fetched
+    from another remote does not count. If neither qualifies and Looker reports unpushed
+    commits, warn; otherwise refuse, printing both remote URLs. No URL is ever compared.
+    Returns the local remote's URL.
     """
     g = LocalGit(proj.root)
     if not g.is_work_tree():
@@ -446,17 +458,24 @@ def commit_check(proj, sess, remote):
     if not (ref or remote_ref):
         out(f'warning: Looker reported no commit for branch {name!r}; the clone was not checked')
         return local_url
-    if g.has_commit(ref) or g.has_commit(remote_ref):
+    local = [sha for sha in dict.fromkeys((ref, remote_ref)) if g.has_commit(sha)]
+    if any(g.on_remote(sha, remote) for sha in local):
         return local_url
     shown = (ref or remote_ref)[:12]
     ahead = info.get('ahead_count') or 0
     if ahead > 0:
-        out(f"warning: Looker's branch {name!r} is on {shown}, which this clone does not have; it has "
+        out(f"warning: Looker's branch {name!r} is on {shown}, which remote {remote!r} does not have; it has "
             f'{ahead} commit(s) Looker has not pushed to the remote yet. Push them from the Looker IDE.')
         return local_url
     looker_url = (sess.project_info() or {}).get('git_remote_url')
-    raise Refused(f"this clone does not have commit {shown}, which Looker's branch {name!r} is on, even "
-                  f'after fetching {remote!r}. It looks like a clone of a different repository.\n'
+    if local:
+        what = (f"commit {local[0][:12]}, which Looker's branch {name!r} is on, is in this clone but on no "
+                f'branch of remote {remote!r}, even after fetching it. That remote looks like a different '
+                'repository, or a copy without Looker\'s commits.\n')
+    else:
+        what = (f"this clone does not have commit {shown}, which Looker's branch {name!r} is on, even "
+                f'after fetching {remote!r}. It looks like a clone of a different repository.\n')
+    raise Refused(what +
                   f"    Looker's remote:  {safe_url(looker_url)}\n"
                   f'    remote {remote!r}:  {safe_url(local_url)}\n'
                   '  Point the remote at the right repository (git remote set-url), or link another '

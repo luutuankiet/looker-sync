@@ -100,9 +100,11 @@ Looker branch together. Unlinked folders behave as above and never run git.
   A project without git, without a remote, or with a Looker-hosted bare repository cannot be
   linked ("there is nothing to clone").
 - **Commit check, every command.** `git fetch`, then the commit Looker's branch is on must be
-  in the clone. A failed fetch only warns. If Looker has commits not pushed to the remote yet,
+  in the clone and on a branch of the linked remote (a commit fetched from another remote does
+  not count). A failed fetch only warns. If Looker has commits not pushed to the remote yet,
   it warns. Otherwise it refuses with "It looks like a clone of a different repository" and
-  prints `Looker's remote:` next to `remote 'origin':`. Fix the remote with
+  prints `Looker's remote:` next to `remote 'origin':` (with "is in this clone but on no branch
+  of remote" when the clone has the commit from another remote). Fix the remote with
   `git remote set-url`, or link another one.
 - **Switch.** `switch --branch X --force` is the one command for a review: Looker moves to X;
   a dirty tree (untracked files too, never `.looker-sync/` or the env file) is stashed as
