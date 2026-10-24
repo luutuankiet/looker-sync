@@ -27,3 +27,9 @@ Everything that rewrites or publishes history stays with the user, in git or the
 
 **Cost.** The user still commits, pushes and pops stashes by hand, and a diverged local
 branch is only warned about, never repaired.
+
+**Amended 2026-10-24 (0.2.1).** One read joins the scope: `for-each-ref`, allowed only with
+`--contains`. The commit check uses it to prove Looker's commit is on a branch of the linked
+remote (`refs/remotes/<remote>/`), not merely somewhere in the clone, so a clone with two
+remotes cannot be linked to the wrong one. It is a pure read; `branch --contains` was not
+chosen because `branch` also deletes and renames, which would need a narrower check.

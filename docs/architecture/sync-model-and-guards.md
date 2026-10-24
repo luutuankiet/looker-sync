@@ -47,7 +47,8 @@ folder starts no git process at all.
   branch reports as `ref`, else `remote_ref`, must exist locally. If neither does and Looker's
   branch is ahead of its remote, it warns; otherwise it refuses and prints Looker's remote URL
   next to the local remote's (user info masked by `safe_url`). No URL is ever compared. It
-  proves the commit exists in the clone, not which remote it came from.
+  proves the commit exists in the clone, not which remote it came from (until 0.2.1; see
+  "Commit check: the linked remote" below).
 - **Switch in a linked folder (`cmd_switch`).** Existing guards first (uncommitted files in
   Looker still refuse, `--force` does not override that); `git_can_follow` refuses a target
   that exists only locally ("push it to the remote first") or only in Looker. Then: Looker
@@ -70,3 +71,16 @@ folder starts no git process at all.
   reads. This applies in unlinked folders too. It was NOT verified live with two users: the
   fake serves the flag, and live showed only that the production branch reads `readonly: true`
   in dev mode.
+
+## Commit check: the linked remote (verified 2026-10-24, 0.2.1)
+
+Since 0.2.1 `commit_check` also proves which remote the commit came from. A commit counts
+only when it exists in the clone (`cat-file -e`) AND `LocalGit.on_remote` finds a ref under
+`refs/remotes/<git_remote>/` that contains it (`for-each-ref --count=1 --contains <sha>
+refs/remotes/<remote>/`, against what the fetch just brought, or what was fetched before when
+the fetch failed). Containment is checked across all of the remote's branches, not only
+Looker's branch, so a new Looker branch with no commits of its own (its commit sits on the
+production branch) still passes. A clone with two remotes linked to the one that lacks
+Looker's commit now refuses with "is in this clone but on no branch of remote" and both URLs;
+"Looker is ahead" still only warns and a failed fetch still only warns. `git_in_scope` allows
+`for-each-ref` only with `--contains` (ADR 0003, amended).
