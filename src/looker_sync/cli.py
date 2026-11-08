@@ -31,6 +31,7 @@ import collections
 import contextlib
 import datetime
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -399,6 +400,7 @@ class Looker:
 
 # ---------------------------------------------------------------- project folder
 
+@functools.lru_cache(maxsize=512)
 def glob_regex(pattern):
     i, rx = 0, ''
     while i < len(pattern):
@@ -1267,6 +1269,9 @@ class WatchCore:
                  hold_check=None, poll=0.05, clock=time.monotonic, wall_ns=time.time_ns,
                  threaded=True, ceiling=None, on_change=None):
         self.proj, self.push_one = proj, push_one
+        # A scan tests every path 20 times a second. The answer depends only on the path and
+        # the config, which a running watch never reloads, so it is worked out once per path.
+        proj.synced = functools.lru_cache(maxsize=65536)(proj.synced)
         self.on_change = on_change   # on_change(rel) when a path starts settling (watch prefetches)
         self.on_event = on_event or (lambda kind, text, paths=(): None)
         self.gate = gate if gate is not None else _gate_default()
@@ -1296,6 +1301,7 @@ class WatchCore:
         self.external_pause = None
         self.retry_at, self.backoff = 0.0, 0.0
         self.git_dir = find_git_dir(proj.root)
+        self.git_busy_paths = [(m, os.path.join(self.git_dir or '', m)) for m in GIT_BUSY]
         self.git_head = self._read_head()
         self.git_busy_until = None
         self.root_id = self._root_id()
@@ -1397,7 +1403,7 @@ class WatchCore:
         """A reason while git is rewriting the clone, and for GIT_QUIET after it stops."""
         if not self.git_dir:
             return None
-        busy = [m for m in GIT_BUSY if os.path.lexists(os.path.join(self.git_dir, m))]
+        busy = [m for m, path in self.git_busy_paths if os.path.lexists(path)]
         head = self._read_head()
         if head != self.git_head:
             self.git_head = head
@@ -1470,7 +1476,8 @@ class WatchCore:
         elif self.paused:
             self.paused = None
             self.on_event('resumed', 'watching again', ())
-        self._racy = self._racy_windows(scan)
+        if scan.entries != prev or not self._racy:   # a pure function of the entries
+            self._racy = self._racy_windows(scan)
         self._detect(scan, now, prev)
         return self._decide(scan, now)
 

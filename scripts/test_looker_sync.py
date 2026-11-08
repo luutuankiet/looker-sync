@@ -3189,5 +3189,49 @@ class WatchNetProdTest(FakeLookerTestCase):
         self.assertEqual(self.writes(), [])
 
 
+class WatchSyncedMemoTest(WatchCoreTestCase):
+    """Idle watch tests each path once, and the memo does not hide new or changed files."""
+
+    def test_repeat_ticks_add_no_sync_set_work(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        first = self.c.proj.synced.cache_info().misses
+        self.assertGreater(first, 0)
+        self.at(1)
+        self.at(2)
+        self.assertEqual(self.c.proj.synced.cache_info().misses, first)
+
+    def test_new_path_is_still_decided_and_seen(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        self.put('b.view.lkml', 'view: b {}\n')
+        self.put('notes.txt', 'not LookML\n')
+        self.at(1)
+        self.assertIn('b.view.lkml', self.c.last_scan.entries)
+        self.assertNotIn('notes.txt', self.c.last_scan.entries)
+
+    def test_same_path_edit_is_seen_through_the_memo(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        with open(full, 'ab') as f:
+            f.write(b'# more\n')
+        self.at(5.0)
+        self.assertEqual(self.at(5.16), {'a.view.lkml': b'view: a {}\n# more\n'})
+
+
+class GlobRegexCacheTest(unittest.TestCase):
+    """The sync-set check runs per path per scan: one compile per pattern keeps idle watch cheap."""
+
+    def test_pattern_compiled_once(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
+        from looker_sync import cli
+        self.assertIs(cli.glob_regex('**/*.view.lkml'), cli.glob_regex('**/*.view.lkml'))
+        self.assertTrue(cli.glob_regex('**/*.view.lkml').match('a/b.view.lkml'))
+        self.assertFalse(cli.glob_regex('*.view.lkml').match('a/b.view.lkml'))
+
+
 if __name__ == '__main__':
     unittest.main()
