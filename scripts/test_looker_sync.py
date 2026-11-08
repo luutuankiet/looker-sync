@@ -9,6 +9,7 @@ It also serves the git fields of the project and branch resources as seen live (
 docs/reference/looker-file-api-behaviour.md). GitTestCase adds real git: a bare repository
 as the remote and a clone of it as the project folder, kept in step by GitRepos.
 """
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -228,6 +229,14 @@ class FakeLooker:
                     if p not in files:
                         return self.reply(404, {'message': 'File not found'})
                     return self.reply(200, raw=files[p])
+                if path == pre + '/directories' and method == 'GET':
+                    return self.reply(200, sorted(fake.dirs))
+                if path == pre + '/directories' and method == 'DELETE':
+                    d = q['path']       # recursive on a live instance: files and child folders go too
+                    fake.dirs -= {x for x in fake.dirs if x == d or x.startswith(d + '/')}
+                    for p in [p for p in files if p.startswith(d + '/')]:
+                        fake.dev_write(p, None)
+                    return self.reply(200, {})
                 if path == pre + '/directories':
                     fake.dirs.add(body['path'])
                     return self.reply(200, {'path': body['path']})
@@ -3185,6 +3194,470 @@ class WatchNetLifecycleTest(WatchNetTestCase):
         self.assertNotIn(SECRET, first + rest)
 
 
+class WatchFolderCleanupTest(WatchNetTestCase):
+    """Looker's folder delete is recursive, so each guard here protects real files."""
+
+    def path(self, rel):
+        return os.path.join(self.dir, *rel.split('/'))
+
+    def rm_calls(self):
+        return [e for e in self.fake.log if e[0] == 'DELETE' and e[1].endswith('/directories')]
+
+    def start_with_folder(self, **kw):
+        w = self.watch(**kw)
+        w.core.DELETE_GRACE = 0.2
+        for rel in ('a/b/one.view.lkml', 'a/b/two.view.lkml'):
+            self.put_local(rel, f'view: {rel.split("/")[-1][:3]} {{}}\n')
+            self.assertTrue(self.wait_for(lambda rel=rel: self.has('verified', rel)), self.lines)
+        return w
+
+    def test_vanished_folder_is_removed_once_topmost_only(self):
+        self.start_with_folder()
+        shutil.rmtree(self.path('a'))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', 'a/ (folder)')), self.lines)
+        self.assertEqual(len(self.rm_calls()), 1)
+        self.assertNotIn('a', self.fake.dirs)
+
+    def test_file_only_in_looker_survives_and_is_reported_once(self):
+        self.start_with_folder()
+        self.fake.uncommitted['a/b/only_here.view.lkml'] = 'view: only_here {}\n'
+        shutil.rmtree(self.path('a'))
+        self.assertTrue(self.wait_for(lambda: any('left in Looker' in ln for ln in self.lines)), self.lines)
+        time.sleep(0.5)
+        self.assertEqual(self.rm_calls(), [])
+        self.assertIn('a/b/only_here.view.lkml', self.fake.dev_files())
+        self.assertEqual(sum('left in Looker' in ln for ln in self.lines), 1, self.lines)
+
+    def test_folder_still_on_disk_is_not_removed(self):
+        self.start_with_folder()
+        os.remove(self.path('a/b/one.view.lkml'))
+        os.remove(self.path('a/b/two.view.lkml'))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', 'two.view')), self.lines)
+        time.sleep(0.5)
+        self.assertEqual(self.rm_calls(), [])
+
+    def test_no_delete_never_calls_it(self):
+        self.start_with_folder(delete=False)
+        shutil.rmtree(self.path('a'))
+        time.sleep(0.6)
+        self.assertEqual(self.rm_calls(), [])
+
+    def test_batch_writes_overlap_and_stay_bounded(self):
+        w = self.watch()
+        lock, now, peak, real = threading.Lock(), [0], [0], w.sess.write
+
+        def slow(path, data, exists):
+            with lock:
+                now[0] += 1
+                peak[0] = max(peak[0], now[0])
+            time.sleep(0.05)
+            real(path, data, exists)
+            with lock:
+                now[0] -= 1
+        w.sess.write = slow
+        for i in range(12):
+            self.put_local(f'v{i}.view.lkml', f'view: v{i} {{}}\n')
+        self.assertTrue(self.wait_for(lambda: all(self.has('verified', f'v{i}.view') for i in range(12))),
+                        self.lines)
+        self.assertGreater(peak[0], 1)
+        self.assertLessEqual(peak[0], w.core.BATCH_WORKERS)
+
+
+class WatchFolderGuardTest(WatchNetTestCase):
+    """One test per guard in front of the recursive folder delete."""
+
+    ONE, TWO = 'a/b/one.view.lkml', 'a/b/two.view.lkml'
+
+    def path(self, rel):
+        return os.path.join(self.dir, *rel.split('/'))
+
+    def rm_calls(self):
+        return [e for e in self.fake.log if e[0] == 'DELETE' and e[1].endswith('/directories')]
+
+    def file_deletes(self):
+        return [e for e in self.fake.log if e[0] == 'DELETE' and e[1].endswith('/files')]
+
+    def started(self, **kw):
+        w = self.watch(**kw)
+        w.core.DELETE_GRACE = 0.2
+        for rel in (self.ONE, self.TWO):
+            self.put_local(rel, f'view: {rel.split("/")[-1][:3]} {{}}\n')
+            self.assertTrue(self.wait_for(lambda rel=rel: self.has('verified', rel)), self.lines)
+        return w
+
+    def assert_no_folder_call_after_rm(self, wait=1.2):
+        shutil.rmtree(self.path('a'))
+        time.sleep(wait)
+        self.assertEqual(self.rm_calls(), [], self.lines)
+
+    def bare_core(self):
+        """A core that is not running, with a recording folder call, for one guard at a time."""
+        w = self.watch(start=False)
+        core, calls = w.core, []
+        core.DELETE_GRACE = 0.2
+        core.delete_folder = lambda d: calls.append(d)
+        core._root_ok = lambda: None
+        core._git_locked = lambda: False
+        return core, calls
+
+    def plan_later(self, core, synced=None, git_now=False):
+        """A first tick starts the grace clock, a second past it may choose."""
+        first = core._plan_folders([], synced or {}, 100.0, git_now)
+        return first or core._plan_folders([], synced or {}, 100.0 + core.DELETE_GRACE + 1, git_now)
+
+    # held, failed or conflicted file under the folder
+
+    def test_failed_delete_under_folder_blocks_it(self):
+        self.started()
+        self.fake.fail_deletes.add(self.ONE)
+        self.assert_no_folder_call_after_rm()
+        self.assertIn(self.ONE, self.fake.dev_files())
+
+    def test_conflicted_file_under_folder_blocks_it(self):
+        self.started()
+        self.fake.dev_write(self.ONE, 'view: changed_there {}\n')
+        self.assert_no_folder_call_after_rm()
+        self.assertIn(self.ONE, self.fake.dev_files())
+
+    def test_plan_held_file_under_folder_blocks_it(self):
+        core, _ = self.bare_core()
+        core.dir_watch['a'] = None
+        self.assertEqual(self.plan_later(core, {'a/b/held.view.lkml': 'h'}), {})
+        self.assertIn('a/', self.plan_later(core) or {'a/': 1})
+
+    def test_recheck_synced_file_blocks_the_call(self):
+        core, calls = self.bare_core()
+        core.synced['a/b/held.view.lkml'] = 'h'
+        self.assertTrue(core._delete_folder('a/', None))
+        self.assertEqual(calls, [])
+
+    # each hold
+
+    def test_no_delete_gives_the_core_no_folder_call(self):
+        self.assertIsNone(self.watch(start=False, delete=False).core.delete_folder)
+
+    def test_prod_mode_refuses_folder_delete(self):
+        w = self.watch(start=False)
+        w.sess.mode = 'production'
+        with self.assertRaises(self.cli.Refused):
+            w.delete_folder('a')
+        self.assertEqual(self.rm_calls(), [])
+
+    def test_paused_or_wrong_branch_refuses_folder_delete(self):
+        w = self.watch(start=False)
+        w._pause('branch', 'workspace is on another branch')
+        self.assertIn('paused', w.delete_folder('a'))
+        self.assertEqual(self.rm_calls(), [])
+
+    def test_recheck_root_gone_blocks_the_call(self):
+        core, calls = self.bare_core()
+        core._root_ok = lambda: 'gone'
+        self.assertFalse(core._delete_folder('a/', None))
+        self.assertEqual(calls, [])
+
+    def test_recheck_external_pause_blocks_the_call(self):
+        core, calls = self.bare_core()
+        core.external_pause = True
+        self.assertFalse(core._delete_folder('a/', None))
+        self.assertEqual(calls, [])
+
+    def test_recheck_git_locked_blocks_the_call(self):
+        core, calls = self.bare_core()
+        core._git_locked = lambda: True
+        self.assertFalse(core._delete_folder('a/', None))
+        self.assertEqual(calls, [])
+
+    def test_recheck_folder_back_on_disk_blocks_the_call(self):
+        core, calls = self.bare_core()
+        os.makedirs(self.path('a'))
+        self.assertTrue(core._delete_folder('a/', None))
+        self.assertEqual(calls, [])
+
+    def test_unreadable_parent_is_never_absent(self):
+        core, _ = self.bare_core()
+        os.makedirs(self.path('a/b'))
+        core.dir_watch['a/b'] = None
+        os.chmod(self.path('a'), 0)
+        try:
+            self.assertEqual(self.plan_later(core), {})
+        finally:
+            os.chmod(self.path('a'), 0o755)
+
+    def test_unreadable_sibling_stops_folder_planning(self):
+        self.started()
+        os.makedirs(self.path('locked'))
+        os.chmod(self.path('locked'), 0)
+        try:
+            self.assert_no_folder_call_after_rm()
+        finally:
+            os.chmod(self.path('locked'), 0o755)
+
+    def test_git_busy_holds_files_and_folder(self):
+        w = self.started()
+        w.core._git_busy = lambda now: 'git is busy'
+        self.assert_no_folder_call_after_rm()
+        self.assertEqual(self.file_deletes(), [])
+
+    def test_ceiling_holds_files_and_folder(self):
+        w = self.started()
+        w.core.ceiling = 1
+        self.assert_no_folder_call_after_rm()
+        self.assertEqual(self.file_deletes(), [])
+
+    def test_syntax_gate_holds_files_and_folder(self):
+        w = self.started()
+        w.core.gate = lambda rel, data: 'bad syntax'
+        self.put_local('z.view.lkml', 'view: z {}\n')
+        self.assert_no_folder_call_after_rm()
+        self.assertEqual(self.file_deletes(), [])
+
+    # git windows
+
+    def test_plan_vanished_during_git_window_is_never_chosen(self):
+        core, _ = self.bare_core()
+        core.dir_watch['a'] = None
+        self.assertEqual(core._plan_folders([], {}, 100.0, True), {})
+        self.assertIn('a', core.dir_left)
+        self.assertEqual(self.plan_later(core), {})
+
+    def test_plan_git_gone_file_does_not_start_watching(self):
+        core, _ = self.bare_core()
+        core.gone['a/one.view.lkml'] = 1.0
+        core.git_gone.add('a/one.view.lkml')
+        core._plan_folders(['a/one.view.lkml'], {}, 100.0, False)
+        self.assertEqual(core.dir_watch, {})
+
+    def test_real_git_checkout_removes_nothing_in_looker(self):
+        def git(*args):
+            return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', *args], cwd=self.dir,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        for rel in (self.ONE, self.TWO):
+            self.put_local(rel, f'view: {rel.split("/")[-1][:3]} {{}}\n')
+        git('init', '-q')
+        with open(self.path('.git/info/exclude'), 'a') as f:
+            f.write('.looker-sync\n')
+        git('add', '-A')
+        git('commit', '-qm', 'base')
+        with tempfile.NamedTemporaryFile() as empty:
+            tree = git('hash-object', '-t', 'tree', '-w', empty.name)
+        git('branch', 'other', git('commit-tree', tree, '-p', 'HEAD', '-m', 'empty'))
+        self.watch().core.DELETE_GRACE = 0.2
+        self.assertTrue(self.wait_for(lambda: self.has('verified', self.TWO)), self.lines)
+        git('checkout', '-q', 'other')
+        self.assertFalse(os.path.exists(self.path('a')))
+        time.sleep(2.0)
+        self.assertEqual((self.rm_calls(), self.file_deletes()), ([], []), self.lines)
+
+    def test_git_init_after_start_still_guards_a_checkout(self):
+        def git(*args):
+            return subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', *args], cwd=self.dir,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        for rel in (self.ONE, self.TWO):
+            self.put_local(rel, f'view: {rel.split("/")[-1][:3]} {{}}\n')
+        self.watch().core.DELETE_GRACE = 0.2
+        self.assertTrue(self.wait_for(lambda: self.has('verified', self.TWO)), self.lines)
+        git('init', '-q')
+        with open(self.path('.git/info/exclude'), 'a') as f:
+            f.write('.looker-sync\n')
+        git('add', '-A')
+        git('commit', '-qm', 'base')
+        with tempfile.NamedTemporaryFile() as empty:
+            tree = git('hash-object', '-t', 'tree', '-w', empty.name)
+        git('branch', 'other', git('commit-tree', tree, '-p', 'HEAD', '-m', 'empty'))
+        git('checkout', '-q', 'other')
+        self.assertFalse(os.path.exists(self.path('a')))
+        time.sleep(2.0)
+        self.assertEqual((self.rm_calls(), self.file_deletes()), ([], []), self.lines)
+
+    # outcome is final; what may never be passed
+
+    def test_failed_folder_call_is_reported_once_and_not_retried(self):
+        w = self.started()
+        w.delete_folder = None
+        calls = []
+
+        def boom(d):
+            calls.append(d)
+            raise self.cli.LookerError('HTTP 500')
+        w.core.delete_folder = boom
+        shutil.rmtree(self.path('a'))
+        self.assertTrue(self.wait_for(lambda: calls), self.lines)
+        time.sleep(1.0)
+        self.assertEqual(calls, ['a'])
+        self.assertEqual(sum('left in Looker' in ln for ln in self.lines), 1, self.lines)
+
+    def test_left_folder_returns_to_consideration_only_after_reappearing(self):
+        core, _ = self.bare_core()
+        core.dir_left.add('a')
+        core.dir_watch['a'] = None
+        self.assertEqual(self.plan_later(core), {})
+        self.assertIn('a', core.dir_left)
+        os.makedirs(self.path('a'))
+        core._plan_folders([], {}, 200.0, False)
+        self.assertNotIn('a', core.dir_left)
+
+    def test_outside_sync_set_is_never_chosen(self):
+        core, _ = self.bare_core()
+        core.proj.synced = lambda p: False
+        core.dir_watch['a'] = None
+        self.assertEqual(self.plan_later(core), {})
+
+    def test_root_level_file_watches_no_folder(self):
+        core, _ = self.bare_core()
+        core.gone['one.view.lkml'] = 1.0
+        core._plan_folders(['one.view.lkml'], {}, 100.0, False)
+        self.assertEqual(core.dir_watch, {})
+
+    def test_folder_absent_at_start_is_left_alone(self):
+        self.put_local(self.ONE, 'view: one {}\n')
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        self.assertTrue(self.wait_for(lambda: self.has('verified', self.ONE)), self.lines)
+        w.close()
+        shutil.rmtree(self.path('a'))
+        self.watch().core.DELETE_GRACE = 0.2
+        time.sleep(1.2)
+        self.assertEqual(self.rm_calls(), [], self.lines)
+
+    # the listing is the last word
+
+    def listing_answers(self, w, answer):
+        real = w.sess.L.call
+
+        def call(method, path, *a, **kw):
+            if method == 'GET' and path.endswith('/files'):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            return real(method, path, *a, **kw)
+        w.sess.L.call = call
+
+    def test_listing_failure_or_odd_shape_sends_no_folder_call(self):
+        for answer in (self.cli.LookerError('HTTP 500'), None, {}, {'path': 'x'}, 'x', [{}], [{'path': 3}], ['p']):
+            with self.subTest(answer=answer):
+                w = self.watch(start=False)
+                before = len(self.rm_calls())
+                self.listing_answers(w, answer)
+                try:
+                    left = w.delete_folder('a')
+                except Exception:  # noqa: BLE001  raising also leaves the folder alone
+                    left = 'raised'
+                self.assertIsNotNone(left)
+                self.assertEqual(len(self.rm_calls()), before)
+
+    def test_listing_is_the_last_call_before_the_delete(self):
+        w = self.watch(start=False)
+        self.fake.dirs.add('a')
+        w.delete_folder('a')
+        calls = [(e[0], e[1].rsplit('/', 1)[-1]) for e in self.fake.log]
+        at = calls.index(('DELETE', 'directories'))
+        self.assertEqual(calls[at - 1], ('GET', 'files'), calls)
+
+    # a move too big to send
+
+    def test_move_of_101_files_is_held_whole(self):
+        self.watch().core.DELETE_GRACE = 0.2
+        names = [f'old/v{i}.view.lkml' for i in range(101)]
+        for rel in names:
+            self.put_local(rel, f'view: v{rel[5:-10]} {{}}\n')
+        self.assertTrue(self.wait_for(lambda: all(self.state_sha(r) for r in names), 40), self.lines[-5:])
+        before = len(self.writes())
+        os.rename(self.path('old'), self.path('new'))
+        self.assertTrue(self.wait_for(lambda: any('202 files changed' in ln for ln in self.lines), 15), self.lines[-5:])
+        time.sleep(0.5)
+        self.assertEqual(len(self.writes()), before, self.lines[-5:])
+        self.assertEqual((self.file_deletes(), self.rm_calls()), ([], []))
+
+    # parallel load
+
+    def test_rule7_under_load_failed_writes_keep_old_paths(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        names = [f'v{i}.view.lkml' for i in range(24)]
+        for rel in names:
+            self.put_local('src/' + rel, f'view: v{rel[1:-10]} {{}}\n')
+        self.assertTrue(self.wait_for(lambda: all(self.state_sha('src/' + r) for r in names), 20), self.lines[-5:])
+        failing = names[:6]
+        self.fake.fail_writes.update('dst/' + r for r in failing)
+        os.rename(self.path('src'), self.path('dst'))
+        self.assertTrue(self.wait_for(lambda: self.has('error'), 10), self.lines[-5:])
+        time.sleep(2.5)     # past the backoff, so a retry would have had its chance
+        files = self.fake.dev_files()
+        for rel in failing:
+            self.assertIn('src/' + rel, files)
+        self.assertEqual(self.file_deletes(), [], 'a failed write must end the batch before any delete')
+
+    def direct_delete(self, known=True, verified=None):
+        w = self.watch(start=False)
+        self.fake.dev_write('old.view.lkml', 'view: old {}\n')
+        data = b'view: old {}\n'
+        if known:
+            w.known['old.view.lkml'] = self.cli.sha(data)
+        if verified:
+            w.verified['new.view.lkml'] = verified
+        return w, self.cli.sha(data)
+
+    def test_delete_refused_when_new_path_unverified_and_absent(self):
+        w, h = self.direct_delete()
+        self.assertIn('not in Looker', w.delete_one('old.view.lkml', 'new.view.lkml', h))
+        self.assertIn('old.view.lkml', self.fake.dev_files())
+
+    def test_delete_refused_when_verified_map_holds_another_sha(self):
+        w, h = self.direct_delete(verified='some-other-sha')
+        self.assertIn('not in Looker', w.delete_one('old.view.lkml', 'new.view.lkml', h))
+        self.assertIn('old.view.lkml', self.fake.dev_files())
+
+    def test_delete_skips_the_read_only_when_verified(self):
+        w, h = self.direct_delete(verified=None)
+        w.verified['new.view.lkml'] = h
+        seen, real = [], w._read_remote
+        w._read_remote = lambda rel: (seen.append(rel), real(rel))[1]
+        self.assertIsNone(w.delete_one('old.view.lkml', 'new.view.lkml', h))
+        self.assertNotIn('new.view.lkml', seen)
+        self.assertNotIn('old.view.lkml', self.fake.dev_files())
+
+    def test_output_lines_of_one_event_stay_together(self):
+        out = []
+
+        def slow(s):
+            out.append(s)
+            time.sleep(0.002)
+        w = self.watch(start=False)
+        w.write_line = slow
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            list(pool.map(lambda i: w.line('x', f't{i}', [f't{i}-a', f't{i}-b']), range(24)))
+        for i in range(0, len(out), 3):
+            head = out[i].split()[-1]
+            self.assertEqual([ln.split()[-1] for ln in out[i:i + 3]], [head, head + '-a', head + '-b'], out)
+
+    def test_state_json_valid_and_matches_after_parallel_batch(self):
+        self.watch()
+        names = [f'p{i}.view.lkml' for i in range(30)]
+        state, bad, stop = os.path.join(self.dir, '.looker-sync', 'state.json'), [], threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(state, encoding='utf-8') as f:
+                        json.load(f)
+                except FileNotFoundError:
+                    pass
+                except ValueError as e:
+                    bad.append(str(e))
+        t = threading.Thread(target=reader)
+        t.start()
+        try:
+            for rel in names:
+                self.put_local(rel, f'view: p{rel[1:-10]} {{}}\n')
+            self.assertTrue(self.wait_for(lambda: all(self.state_sha(r) for r in names), 20), self.lines[-5:])
+        finally:
+            stop.set()
+            t.join()
+        self.assertEqual(bad, [])
+        for rel in names:
+            self.assertEqual(self.state_sha(rel), self.cli.sha(self.fake.dev_files()[rel].encode()))
+
+
 class WatchNetProdTest(FakeLookerTestCase):
     def test_watch_refused_in_prod_mode(self):
         r = self.run_cli('init', '--project', PROJECT, '--mode', 'prod')
@@ -3455,7 +3928,7 @@ class WatchDeleteRulesNetTest(WatchDeleteNetCase):
         self.assertIn(only, self.fake.dev_files())
         self.assertEqual(len(self.deletes()), 1)
 
-    def test_rule5_changed_in_looker_is_held_then_force_deletes(self):
+    def test_rule5_changed_in_looker_holds_the_delete(self):
         w = self.watch()
         w.core.DELETE_GRACE = 0.2
         self.fake.uncommitted[self.ORDERS] = 'view: orders { # edited in the IDE\n}\n'

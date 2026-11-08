@@ -15,7 +15,8 @@ endpoint, so those stay with git and the Looker IDE.
     push    [--force] [--delete] [--dry-run]              write local edits, read back, validate
     watch   [--validate] [--verbose] [--poll MS] [--force] [--no-delete]  push each save as it
             happens: ack, then verified; a file you delete or rename while it runs is deleted in
-            Looker too (--no-delete only reports it); holds Looker edits and syntax errors,
+            Looker too, and a folder that vanished with it once Looker has no file left there
+            (--no-delete only reports it); holds Looker edits and syntax errors,
             pauses off-branch; a git checkout, pull or rebase never deletes anything
     switch  (--branch B | --mode dev|prod) [--local-changes push|backup|cancel] [--yes] [--force]
             --force = --local-changes backup --yes; when linked, git follows: stash, checkout, ff
@@ -1197,6 +1198,12 @@ def _skey(e):
     return (e.mtime_ns, e.size, e.ino, e.dev)
 
 
+def _under_any(paths, folder):
+    """True when any of paths lies inside folder."""
+    prefix = folder + '/'
+    return any(p.startswith(prefix) for p in paths)
+
+
 def _under(path, folders):
     return any(d == '' or path.startswith(d + '/') for d in folders)
 
@@ -1261,6 +1268,11 @@ class _Delete:
         self.new_path, self.new_sha = new_path, new_sha
 
 
+class _DeleteFolder:
+    """A batch value meaning: remove this vanished folder from Looker. Its key ends in '/'."""
+    __slots__ = ()
+
+
 class WatchCore:
     """Scanner plus one-slot worker for `watch`. No network: the caller supplies
 
@@ -1294,12 +1306,16 @@ class WatchCore:
     GIT_QUIET = 0.3
     CEILING = 200
     DELETE_GRACE = 1.5      # seconds a path must stay absent: outlasts an editor's atomic save
+    BATCH_WORKERS = 8       # files of one batch sent at once
 
     def __init__(self, proj, push_one, remote_state=None, on_event=None, gate=None,
                  hold_check=None, poll=0.05, clock=time.monotonic, wall_ns=time.time_ns,
-                 threaded=True, ceiling=None, on_change=None, delete_one=None):
+                 threaded=True, ceiling=None, on_change=None, delete_one=None, delete_folder=None):
         self.proj, self.push_one = proj, push_one
         self.delete_one = delete_one
+        self.delete_folder = delete_folder
+        self.dir_watch = {}     # folder that lost a synced file this run -> clock first seen absent
+        self.dir_left = set()   # folders never to clean up, unless they reappear locally
         # A scan tests every path 20 times a second. The answer depends only on the path and
         # the config, which a running watch never reloads, so it is worked out once per path.
         proj.synced = functools.lru_cache(maxsize=65536)(proj.synced)
@@ -1437,10 +1453,24 @@ class WatchCore:
         except OSError:
             return None
 
+    def _attach_git(self):
+        """A `git init` after watch started: without this its checkouts would look like `rm`."""
+        self.git_dir = find_git_dir(self.proj.root)
+        if not self.git_dir:
+            return False
+        self.git_busy_paths = [(m, os.path.join(self.git_dir, m)) for m in GIT_BUSY]
+        self.git_head = self._read_head()
+        self.git_common = git_common_dir(self.git_dir)
+        self.git_refs = self._git_refs() if self.delete_one else None
+        return True
+
     def _git_busy(self, now):
         """A reason while git is rewriting the clone, and for GIT_QUIET after it stops."""
         if not self.git_dir:
-            return None
+            if not self._attach_git():
+                return None
+            self.git_busy_until = now + self.GIT_QUIET
+            return 'git appeared in this folder'
         busy = [m for m, path in self.git_busy_paths if os.path.lexists(path)]
         head = self._read_head()
         if head != self.git_head:
@@ -1766,6 +1796,10 @@ class WatchCore:
         if deleting:
             due, delete_count = self._plan_deletes(scan, missing, synced, held_remote, held_delete,
                                                    now, keep, git_now)
+            if not scan.unreadable:
+                folders = self._plan_folders(missing, synced, now, git_now)
+                due.update(folders)
+                delete_count += len(folders)
         else:
             moved_from = set(m.split(' -> ')[0] for m in moves)
             deleted = [m for m in missing if m not in moved_from]
@@ -1845,6 +1879,39 @@ class WatchCore:
                             'new path is held', parked)
         return due, len(candidates)
 
+    def _plan_folders(self, missing, synced, now, git_now):
+        """Vanished folders to remove from Looker ({'dir/': _DeleteFolder}), topmost only. A folder
+        qualifies when a synced file under it vanished this run, it has stayed absent for
+        DELETE_GRACE with git quiet, and no synced file remains under it: a held, failed or
+        conflicted file stays in synced, so it blocks. Nothing here looks at Looker."""
+        if self.delete_folder is None:
+            return {}
+        with self.lock:
+            for rel in missing:
+                if rel in self.gone and rel not in self.git_gone:
+                    parts = rel.split('/')[:-1]
+                    for i in range(1, len(parts) + 1):
+                        self.dir_watch.setdefault('/'.join(parts[:i]), None)
+            self.dir_left = {d for d in self.dir_left if self._absent(d)}   # back: may qualify again
+            chosen = []
+            for d in sorted(self.dir_watch):
+                if not self._absent(d):
+                    self.dir_watch[d] = None        # still here, or back: a full grace again
+                    continue
+                if self.dir_watch[d] is None:
+                    if git_now:                     # vanished with git active: never cleaned up
+                        self.dir_left.add(d)
+                        continue
+                    self.dir_watch[d] = now
+                if git_now or now - self.dir_watch[d] < self.DELETE_GRACE:
+                    continue
+                if (d in self.dir_left or _under(d, self.dir_left)
+                        or not self.proj.synced(d + '/x.lkml')   # outside the sync set
+                        or _under_any(synced, d) or _under(d, chosen)):
+                    continue
+                chosen.append(d)
+        return {d + '/': _DeleteFolder() for d in chosen}
+
     def _gatekeep(self, pending, now, keep, broken=(), git_reason=None, deletes=None,
                   delete_count=0):
         """The batch to push now, or None. Every reason to hold applies to the whole batch,
@@ -1901,38 +1968,88 @@ class WatchCore:
             self._push_batch(batch)
 
     def _push_batch(self, batch):
-        """New files first (an include may need them), then changed ones, in path order."""
+        """New files first (an include may need them), then changed ones, then deletes, then
+        folders. Each phase runs at once on a bounded pool and the next waits for it, so a
+        rename's old path can never overtake a write. A failure ends the batch."""
         try:
-            with self.lock:     # deletes last: a rename's new path always goes first
-                order = sorted(batch, key=lambda p: (isinstance(batch[p], _Delete),
-                                                     p in self.synced, p))
-            for rel in order:
-                data = batch[rel]
-                if isinstance(data, _Delete):
-                    if not self._delete_path(rel, data):
-                        return
-                    continue
-                try:
-                    result = self.push_one(rel, data)
-                except Exception as e:  # noqa: BLE001
-                    with self.lock:
-                        self.backoff = min(max(self.backoff * 2, 1.0), 30.0)
-                        self.retry_at = self.clock() + self.backoff
-                    self.on_event('error', f'{rel}: {e}; retrying in {self.backoff:.0f} s',
-                                  (rel,))
+            with self.lock:
+                new = sorted(p for p, v in batch.items()
+                             if not isinstance(v, (_Delete, _DeleteFolder)) and p not in self.synced)
+            changed = sorted(p for p, v in batch.items()
+                             if not isinstance(v, (_Delete, _DeleteFolder)) and p not in new)
+            deletes = sorted(p for p, v in batch.items() if isinstance(v, _Delete))
+            folders = sorted(p for p, v in batch.items() if isinstance(v, _DeleteFolder))
+            for paths, work in ((new, self._write_path), (changed, self._write_path),
+                                (deletes, self._delete_path), (folders, self._delete_folder)):
+                if not self._run_phase(paths, work, batch):
                     return
-                with self.lock:
-                    if isinstance(result, str):
-                        self.held_remote[rel] = (sha(data), result)
-                    else:
-                        self.synced[rel] = sha(data)
-                        self.held_remote.pop(rel, None)
-                        self.backoff = 0.0
-                if not isinstance(result, str):
-                    self.on_event('pushed', rel, (rel,))
         finally:
             with self.lock:
                 self.inflight = None
+
+    def _run_phase(self, paths, work, batch):
+        """Run work(rel, batch[rel]) for each path; False once any of them ended the batch."""
+        stop = threading.Event()
+
+        def one(rel):
+            if not stop.is_set() and not work(rel, batch[rel]):
+                stop.set()
+        if not self.threaded or len(paths) < 2:
+            for rel in paths:
+                one(rel)
+            return not stop.is_set()
+        with concurrent.futures.ThreadPoolExecutor(min(self.BATCH_WORKERS, len(paths)),
+                                                   thread_name_prefix='watch-send') as pool:
+            for f in [pool.submit(one, rel) for rel in paths]:
+                f.result()
+        return not stop.is_set()
+
+    def _write_path(self, rel, data):
+        """One write from a batch. Returns False to end the batch."""
+        try:
+            result = self.push_one(rel, data)
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                self.backoff = min(max(self.backoff * 2, 1.0), 30.0)
+                self.retry_at = self.clock() + self.backoff
+            self.on_event('error', f'{rel}: {e}; retrying in {self.backoff:.0f} s', (rel,))
+            return False
+        with self.lock:
+            if isinstance(result, str):
+                self.held_remote[rel] = (sha(data), result)
+            else:
+                self.synced[rel] = sha(data)
+                self.held_remote.pop(rel, None)
+                self.backoff = 0.0
+        if not isinstance(result, str):
+            self.on_event('pushed', rel, (rel,))
+        return True
+
+    def _delete_folder(self, key, _item):
+        """One folder from a batch; every local guard is checked again just before the call.
+        The outcome is final: a folder left or a failed call is reported once, never retried."""
+        d = key[:-1]
+        if self._root_ok() or self.external_pause or self._git_locked():
+            return False
+        with self.lock:
+            if _under_any(self.synced, d):
+                return True
+        if not self._absent(d):
+            return True
+        try:
+            left = self.delete_folder(d)
+        except Exception as e:  # noqa: BLE001
+            left = f'the call failed ({e})'
+        with self.lock:
+            self.dir_watch.pop(d, None)
+            if left is None:
+                for child in [c for c in self.dir_watch if c.startswith(key)]:
+                    del self.dir_watch[child]
+            else:
+                self.dir_left.add(d)
+        if left is not None:
+            self.on_event('notice', f'folder {d}/ left in Looker: {left}', ())
+        return True
 
     def _absent(self, rel):
         """True only when the path is certainly not on disk; any other answer keeps the file."""
@@ -2008,6 +2125,7 @@ class WatchNet:
         self.known = dict(proj.state.get('files', {}))   # rel -> sha Looker holds as far as we know
         self.gen = {}            # rel -> count of acked writes
         self.mismatch = {}       # rel -> sha Looker kept after a read-back mismatch
+        self.verified = {}       # rel -> sha read back from Looker since its last write
         self.dropped = set()     # rel deleted in Looker: a read-back still queued must not record it
         self.prefetch = {}       # rel -> (monotonic start, gen at start, Future)
         self.reasons = {}        # pause key -> text
@@ -2020,29 +2138,30 @@ class WatchNet:
         self.stop_event = threading.Event()
         self.kick = threading.Event()
         self.verify_q = queue.Queue()
-        self.reader = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix='watch-read')
+        self.reader = concurrent.futures.ThreadPoolExecutor(WatchCore.BATCH_WORKERS, thread_name_prefix='watch-read')
         self.threads = []
         self.core = WatchCore(proj, self.push_one, remote_state=lambda: dict(self.known),
                               on_event=self.on_event, hold_check=self.hold_check,
                               on_change=self.on_change, poll=poll,
-                              delete_one=self.delete_one if delete else None, **core_kw)
+                              delete_one=self.delete_one if delete else None,
+                              delete_folder=self.delete_folder if delete else None, **core_kw)
         self.L.before_token_swap = self._before_swap
         self.L.on_refresh_error = lambda e: self.line('notice', f'token refresh failed ({e}); retrying')
 
     # ---- output
 
-    def line(self, kind, text):
+    def line(self, kind, text, more=()):
+        """Print one event; its lines stay together however many threads are printing."""
         stamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
         with self.print_lock:
-            self.write_line(f'{stamp} {kind:<8} {text}')
+            for t in (text, *more):
+                self.write_line(f'{stamp} {kind:<8} {t}')
 
     def on_event(self, kind, text, paths=()):
         if kind in ('pushed', 'deleted'):
             return                   # push_one and delete_one already printed their own line
         gate = kind == 'held' and text.startswith('syntax error')
-        self.line(kind, text)
-        for p in paths:
-            self.line(kind, f'  {p} {GATE_HINT}' if gate else f'  {p}')
+        self.line(kind, text, [f'  {p} {GATE_HINT}' if gate else f'  {p}' for p in paths])
 
     # ---- pause reasons (branch, auth) on top of the core's own
 
@@ -2124,6 +2243,7 @@ class WatchNet:
                 with self.lock:
                     self.known[rel] = h
                     self.mismatch.pop(rel, None)
+                    self.verified[rel] = h
                 self.dropped.discard(rel)
                 self._record(rel, h)
                 self.line('verified', f'{rel} (already in Looker)')
@@ -2145,6 +2265,7 @@ class WatchNet:
         with self.lock:
             g = self.gen[rel] = self.gen.get(rel, 0) + 1
             self.known[rel] = h
+            self.verified.pop(rel, None)
             self.writes_since_check += 1
             self.last_write, self.to_validate = time.monotonic(), True
         self.line('ack', rel)
@@ -2161,8 +2282,13 @@ class WatchNet:
         if paused:
             raise LookerError(f'not deleted while paused: {paused}')
         try:
-            if new_path is not None and sha(self._read_remote(new_path)) != new_sha:
-                return f'{new_path} is not in Looker as written, so the old path stays'
+            with self.lock:
+                checked = new_path is None or self.verified.get(new_path) == new_sha
+            if not checked:          # no read-back has finished yet: this one is the proof
+                if sha(self._read_remote(new_path)) != new_sha:
+                    return f'{new_path} is not in Looker as written, so the old path stays'
+                with self.lock:
+                    self.verified[new_path] = new_sha
             remote = self._read_remote(rel)
             if remote is None:
                 self._drop(rel)
@@ -2190,6 +2316,38 @@ class WatchNet:
         self.line('deleted', f'{rel} (moved to {new_path})' if new_path else rel)
         return None
 
+    def delete_folder(self, d):
+        """None once Looker no longer has folder d; otherwise why it was left. Looker's call is
+        recursive, so a listing taken just before it must show no file at all under d."""
+        if self.sess.mode != 'dev':
+            raise Refused('watch never deletes in prod mode')
+        with self.lock:
+            paused = '; '.join(self.reasons.values())
+        if paused:
+            return f'not removed while paused: {paused}'
+        prefix, base = d + '/', f'/projects/{self.sess.project}/directories'
+        try:
+            files = self.L.call('GET', f'/projects/{self.sess.project}/files')
+            if not isinstance(files, list) or not all(
+                    isinstance(f, dict) and isinstance(f.get('path'), str) for f in files):
+                return 'Looker answered the file listing in an unexpected shape, so it was not removed'
+            count = sum(f['path'].startswith(prefix) for f in files)
+            if count:
+                return f'Looker has {count} file(s) there'
+            st, payload = self.L.try_call('DELETE', base, {'path': d})
+            if st >= 400:
+                raise LookerError(f'DELETE folder -> HTTP {st}: {payload}')
+            still = [x.get('path') if isinstance(x, dict) else x for x in self.L.call('GET', base) or []]
+        except AuthExpired as e:
+            self._pause('auth', f'Looker refused the session ({e}); paused, logging in again '
+                        f'every {self.BRANCH_EVERY:.0f} s')
+            self.kick.set()
+            raise
+        if d in still:
+            return 'Looker accepted the removal but still lists the folder'
+        self.line('deleted', f'{d}/ (folder)')
+        return None
+
     def _drop(self, rel):
         """Looker no longer has rel: out of state.json and out of what we know, as push does."""
         with self.state_lock:
@@ -2198,6 +2356,7 @@ class WatchNet:
         with self.lock:
             self.gen[rel] = self.gen.get(rel, 0) + 1
             self.known.pop(rel, None)
+            self.verified.pop(rel, None)
             self.mismatch.pop(rel, None)
             self.prefetch.pop(rel, None)
 
@@ -2234,7 +2393,10 @@ class WatchNet:
             with self.lock:
                 current = self.gen.get(rel) == g
             if bh == h:
-                if self._record_unless_dropped(rel, h):
+                with self.lock:
+                    if current:
+                        self.verified[rel] = h
+                if current and self._record_unless_dropped(rel, h):
                     self.line('verified', rel)
             elif current:
                 with self.lock:
@@ -2344,8 +2506,9 @@ class WatchNet:
 
     def start(self):
         self.L.start_auto_refresh()
-        self.threads = [threading.Thread(target=self._verify_loop, daemon=True, name='watch-verify'),
-                        threading.Thread(target=self._branch_loop, daemon=True, name='watch-branch')]
+        self.threads = [threading.Thread(target=self._verify_loop, daemon=True, name='watch-verify')
+                        for _ in range(WatchCore.BATCH_WORKERS)]
+        self.threads.append(threading.Thread(target=self._branch_loop, daemon=True, name='watch-branch'))
         for t in self.threads:
             t.start()
         self.core.start()
