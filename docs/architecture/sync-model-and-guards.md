@@ -1,7 +1,7 @@
 ---
 title: Sync model and guards
 covers: how pull, push, status and switch decide what to write, which guard refuses what, and where in looker_sync.py each lives
-verified: 2026-10-24
+verified: 2026-11-08
 ---
 
 # Sync model and guards
@@ -84,3 +84,34 @@ production branch) still passes. A clone with two remotes linked to the one that
 Looker's commit now refuses with "is in this clone but on no branch of remote" and both URLs;
 "Looker is ahead" still only warns and a failed fetch still only warns. `git_in_scope` allows
 `for-each-ref` only with `--contains` (ADR 0003, amended).
+
+## Fast push: what push reads and when it fetches (verified 2026-11-08)
+
+- **Push reads only the files it will write or delete (`push_reads`, `do_push`).** Push lists
+  Looker's files once, then reads only those it may change: a listed file whose local hash
+  differs from `state.json` (a new local file that Looker already lists included), or a file
+  deleted locally that Looker still lists. A push with nothing changed reads no file; a push
+  of one changed file reads that one file before writing it, then reads it back. Every file
+  push writes or deletes is still read first, so the "changed in Looker" refusal, `--force`,
+  the byte-for-byte read-back and validation are unchanged for those files.
+- **A file changed only in Looker no longer blocks push.** If a file is unchanged locally,
+  push leaves it alone whatever Looker holds, so it is not read and cannot refuse the push.
+  Push plans it as unchanged in Looker. A file changed on both sides is still refused, and a
+  file deleted in Looker (in `state.json`, no longer listed) is still refused from the listing
+  alone. `status` and `pull` still read every file and report Looker's changes.
+- **Push skips `git fetch` when it is not needed (`commit_check(fetch=False)`).** In a linked
+  folder, push first checks Looker's `ref` and `remote_ref` against the clone's remote
+  branches as last fetched. If one is already in the clone and on a branch of the linked
+  remote, the check passes without fetching: a fetch without `--prune` only adds refs, so it
+  could not turn that pass into a refusal. Otherwise push fetches and runs the full check.
+  `status`, `switch` and `link` still fetch every time (`git_can_follow` needs fresh tracking
+  refs).
+- **`push --no-validate`** skips Looker validation and prints `validation: skipped
+  (--no-validate)`; the read-back still runs.
+- **`push --verbose`** prints one `timing: <phase> <seconds>` line per phase on stderr (session,
+  commit check, drift guard, local scan, file list, remote reads, write and read-back,
+  validate, total) and shows info-severity validation lines. Without it, push hides those
+  lines and says how many it hid: `(N info line(s) hidden; --verbose shows them)`.
+- **Measured live** (Linux, sandbox, median of 5): a push with no change went from 8.2 s to
+  2.9 s, a push of one changed file from 10.2 s to 5.3 s. Session setup is now most of a
+  no-change push.

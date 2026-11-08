@@ -13,6 +13,8 @@ endpoint, so those stay with git and the Looker IDE.
     pull    [--force] [--dry-run]                         copy Looker files to disk
     status                                                show what differs on each side
     push    [--force] [--delete] [--dry-run]              write local edits, read back, validate
+    watch   [--validate] [--verbose] [--poll MS] [--force]  push each save as it happens: ack, then
+            verified; holds Looker edits and syntax errors, pauses off-branch, never deletes
     switch  (--branch B | --mode dev|prod) [--local-changes push|backup|cancel] [--yes] [--force]
             --force = --local-changes backup --yes; when linked, git follows: stash, checkout, ff
     skill   [--path]                                      print the full usage guide for agents
@@ -26,11 +28,13 @@ Exit codes: 0 ok, 1 Looker or network error, 2 refused by a guard, 3 validation 
 """
 import argparse
 import collections
+import contextlib
 import datetime
 import errno
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import stat
@@ -878,13 +882,15 @@ def not_linkable(info, project):
     return None
 
 
-def commit_check(proj, sess, remote):
+def commit_check(proj, sess, remote, fetch=True):
     """Prove the linked remote and the Looker project are one repository: the remote has Looker's commit.
 
     Fetch first (a failure only warns). Then Looker's `ref`, else `remote_ref`, must exist in
     the clone AND be reachable from a ref under refs/remotes/<remote>/, so a commit fetched
     from another remote does not count. If neither qualifies and Looker reports unpushed
     commits, warn; otherwise refuse, printing both remote URLs. No URL is ever compared.
+    fetch=False (push) fetches only when needed: when the commit already passes against the
+    remote as last fetched, a fetch could not change the verdict, so it is skipped.
     Returns the local remote's URL.
     """
     g = LocalGit(proj.root)
@@ -894,11 +900,15 @@ def commit_check(proj, sess, remote):
     if local_url is None:
         raise Refused(f'no git remote named {remote!r} in {proj.root}; '
                       'list them with `git remote -v`, then: looker-sync link --remote NAME')
+    info = getattr(sess, 'branch_info', None) or {}
+    name, ref, remote_ref = info.get('name') or sess.branch, info.get('ref'), info.get('remote_ref')
+    shas = list(dict.fromkeys(s for s in (ref, remote_ref) if s))
+    # fetch adds refs and never removes one (no --prune), so a pass without it stays a pass after it
+    if not fetch and any(g.has_commit(s) and g.on_remote(s, remote) for s in shas):
+        return local_url
     err = g.fetch(remote)
     if err:
         out(f'warning: git fetch {remote} failed ({err}); checking against what was fetched before')
-    info = getattr(sess, 'branch_info', None) or {}
-    name, ref, remote_ref = info.get('name') or sess.branch, info.get('ref'), info.get('remote_ref')
     if not (ref or remote_ref):
         out(f'warning: Looker reported no commit for branch {name!r}; the clone was not checked')
         return local_url
@@ -1006,18 +1016,24 @@ class Session:
     def delete(self, path):
         self.L.call('DELETE', f'/projects/{self.project}/files', {'file_path': path})
 
-    def validate(self):
+    def validate(self, verbose=True):
+        """Validate the project, print its findings, return the error count.
+        verbose=False hides info-severity lines and says how many it hid."""
         res = self.L.call('POST', f'/projects/{self.project}/validate') or {}
-        errors = 0
+        errors = hidden = 0
         for e in res.get('errors') or []:
             sev = e.get('severity') or 'error'
+            if sev == 'info' and not verbose:
+                hidden += 1
+                continue
             where = e.get('source_file') or e.get('file_path') or f'(no file; model {e.get("model_id") or "?"})'
             if e.get('line_number') or e.get('line'):
                 where += f':{e.get("line_number") or e.get("line")}'
             out(f'  {sev:7} {where}  {e.get("message")}')
             if sev in ('error', 'fatal'):
                 errors += 1
-        out(f'validation: {errors} error(s)' if errors else 'validation: no errors')
+        out((f'validation: {errors} error(s)' if errors else 'validation: no errors')
+            + (f' ({hidden} info line(s) hidden; --verbose shows them)' if hidden else ''))
         return errors
 
     def uncommitted(self):
@@ -1025,13 +1041,40 @@ class Session:
                 for f in self.file_list() if f.get('git_status')]
 
 
-def open_session(proj, args, check_branch=True):
-    """The Looker session every command starts with; in a linked folder, the commit check too."""
+def open_session(proj, args, check_branch=True, fetch=True, phases=None):
+    """The Looker session every command starts with; in a linked folder, the commit check too.
+    fetch=False lets the commit check skip `git fetch` when it is not needed (push)."""
+    phases = phases or Phases()
     cfg = proj.require_config()
-    sess = Session(proj, args.env_file, cfg['mode'], cfg['project'], cfg.get('branch'), check_branch)
+    with phases('session'):
+        sess = Session(proj, args.env_file, cfg['mode'], cfg['project'], cfg.get('branch'), check_branch)
     if cfg.get('git_remote'):
-        commit_check(proj, sess, cfg['git_remote'])
+        with phases('commit check'):
+            commit_check(proj, sess, cfg['git_remote'], fetch=fetch)
     return sess
+
+
+class Phases:
+    """Wall time of each step of a command; printed on stderr only when verbose."""
+
+    def __init__(self, verbose=False):
+        self.verbose, self.started = verbose, time.perf_counter()
+
+    @contextlib.contextmanager
+    def __call__(self, label, detail=''):
+        s = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.note(label, time.perf_counter() - s, detail)
+
+    def note(self, label, seconds, detail=''):
+        if self.verbose:
+            print(f'timing: {label:<14} {seconds:7.3f}s{"  " + detail if detail else ""}',
+                  file=sys.stderr, flush=True)
+
+    def total(self):
+        self.note('total', time.perf_counter() - self.started)
 
 
 # ---------------------------------------------------------------- sync plan
@@ -1050,9 +1093,14 @@ REMOTE_CHANGED = ('remote-modified', 'remote-deleted', 'conflict')
 
 def plan(local, remote, known):
     """{path: kind} for every path that differs. known = {path: sha at last sync}."""
+    return plan_hashes({p: sha(d) for p, d in local.items()}, {p: sha(d) for p, d in remote.items()}, known)
+
+
+def plan_hashes(local, remote, known):
+    """plan() on hashes: local and remote are {path: sha}; a path that is absent does not exist."""
     kinds = {}
     for path in sorted(set(local) | set(remote) | set(known)):
-        lh, rh, s = sha(local.get(path)), sha(remote.get(path)), known.get(path)
+        lh, rh, s = local.get(path), remote.get(path), known.get(path)
         if lh == rh:
             continue
         lc, rc = lh != s, rh != s
@@ -1147,6 +1195,39 @@ def _under(path, folders):
     return any(d == '' or path.startswith(d + '/') for d in folders)
 
 
+COARSE_TICK_NS = 2_000_000_000
+
+
+def mtime_tick(meta_dir, budget=0.1):
+    """The mtime step of the volume holding meta_dir, in ns: keep appending to a probe file
+    in meta_dir until fstat's mtime has changed twice and return the smallest step seen.
+    No change within `budget` seconds (or no probe possible): 2 s, the coarsest tick
+    (FAT). Only meta_dir is written; the probe is always removed."""
+    path = os.path.join(meta_dir, f'.mtime-probe-{os.getpid()}')
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        return COARSE_TICK_NS
+    try:
+        seen, end = [], time.monotonic() + budget
+        while len(seen) < 3 and time.monotonic() < end:
+            os.write(fd, b'.')
+            m = os.fstat(fd).st_mtime_ns
+            if not seen or m != seen[-1]:
+                seen.append(m)
+        if len(seen) < 3:
+            return COARSE_TICK_NS
+        return min(b - a for a, b in zip(seen, seen[1:]))
+    except OSError:
+        return COARSE_TICK_NS
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 class _Track:
     """A path whose stat changed and is waiting to settle."""
     __slots__ = ('first', 'last', 'settle')
@@ -1168,6 +1249,7 @@ class WatchCore:
                          emitted on change only, never repeated every tick
     gate(rel, data)      None if the bytes may be pushed, else a reason (default: gate.check)
     hold_check()         None, or a reason to hold every push this tick (branch mismatch...)
+    on_change(rel)       called when a path starts settling, so the caller can read ahead
 
     tick() runs one reconcile and is what tests call with a fake clock. start()/stop() run the
     scanner and the worker in threads. pause(reason)/resume() pause pushing from outside.
@@ -1183,8 +1265,9 @@ class WatchCore:
 
     def __init__(self, proj, push_one, remote_state=None, on_event=None, gate=None,
                  hold_check=None, poll=0.05, clock=time.monotonic, wall_ns=time.time_ns,
-                 threaded=True, ceiling=None):
+                 threaded=True, ceiling=None, on_change=None):
         self.proj, self.push_one = proj, push_one
+        self.on_change = on_change   # on_change(rel) when a path starts settling (watch prefetches)
         self.on_event = on_event or (lambda kind, text, paths=(): None)
         self.gate = gate if gate is not None else _gate_default()
         self.hold_check = hold_check or (lambda: None)
@@ -1201,7 +1284,13 @@ class WatchCore:
         self.held_remote = {}   # rel -> (sha, reason) returned by push_one
         self.gate_cache = {}    # sha -> reason
         self.bad = {}           # rel -> read status of a file that cannot be read
-        self._racy_ns = 20_000_000
+        try:
+            self.meta_dev = os.stat(proj.meta).st_dev
+        except OSError:
+            self.meta_dev = None
+        self.mtime_tick = mtime_tick(proj.meta)   # ns, measured once on the meta dir's volume
+        self._racy = {}         # dev -> racy-mtime window in ns, refreshed every scan
+        self.cycle = poll       # measured seconds between tick starts (moving average)
         self.last_scan = None
         self.inflight = None
         self.external_pause = None
@@ -1334,6 +1423,11 @@ class WatchCore:
         t = self.tracks.get(rel)
         if t is None:
             self.tracks[rel] = _Track(now, settle)
+            if self.on_change:
+                try:
+                    self.on_change(rel)
+                except Exception:  # noqa: BLE001  a hint only; never stops the scan
+                    pass
         else:
             t.last, t.settle = now, settle
         self.last_change[rel] = now
@@ -1343,8 +1437,11 @@ class WatchCore:
         with self.lock:
             keep = data if h != self.synced.get(rel) else None
         self.cache[rel] = (_skey(entry), h, keep, read_ns)
-        if entry.mtime_ns >= read_ns - self._racy_ns:
+        if entry.mtime_ns >= read_ns - self._racy_for(entry):
             self.recheck.add(rel)
+
+    def _racy_for(self, entry):
+        return self._racy.get(entry.dev) or self._window(self._base_tick(entry.dev))
 
     # ------------------------------------------------------------ one reconcile
 
@@ -1373,28 +1470,53 @@ class WatchCore:
         elif self.paused:
             self.paused = None
             self.on_event('resumed', 'watching again', ())
-        self._racy_ns = self._racy_window(scan)
+        self._racy = self._racy_windows(scan)
         self._detect(scan, now, prev)
         return self._decide(scan, now)
 
     def _watch_clock(self, now):
-        if self.last_tick is not None and now - self.last_tick > max(2.0, 10 * self.interval):
-            self.on_event('notice', f'no scan for {now - self.last_tick:.1f} s (stalled or '
-                                    'asleep); catching up with the latest state', ())
+        """Stall and clock-jump notices; keeps `cycle`, the real time between tick starts
+        (a 50 ms sleep can take about 118 ms on a laptop on battery)."""
+        if self.last_tick is not None:
+            gap = now - self.last_tick
+            if gap > max(2.0, 10 * self.cycle):
+                self.on_event('notice', f'no scan for {gap:.1f} s (stalled or '
+                                        'asleep); catching up with the latest state', ())
+            elif gap >= 0:              # clamped: one slow tick must not double the average
+                self.cycle = 0.8 * self.cycle + 0.2 * min(gap, 3 * self.cycle)
         self.last_tick = now
         offset = self.wall_ns() / 1e9 - now
         if self.offset is not None and abs(offset - self.offset) > 1.0:
             self.on_event('notice', f'system clock jumped by {offset - self.offset:+.1f} s', ())
         self.offset = offset
 
+    DEFAULT_TICK_NS = 10_000_000    # a volume other than the meta dir's: Linux steps 1-4 ms
+
+    def _base_tick(self, dev):
+        return self.mtime_tick if dev == self.meta_dev else self.DEFAULT_TICK_NS
+
     @staticmethod
-    def _racy_window(scan):
-        """One mtime tick: 2 s on a filesystem that stores whole seconds (HFS+, FAT, exFAT),
-        else 20 ms (Linux timestamps step in 1 to 4 ms ticks)."""
-        ms = [e.mtime_ns for e in scan.entries.values()]
-        if ms and all(m % 1_000_000_000 == 0 for m in ms[:50]):
-            return 2_000_000_000
-        return 20_000_000
+    def _window(tick):
+        """A write within this many ns of a read may share the read's mtime tick."""
+        return max(2 * tick, 2_000_000)
+
+    def _racy_windows(self, scan):
+        """dev -> window. The tick is the measured one, raised to 2 s or 1 s when every
+        sampled mtime on that volume is a multiple of it (HFS+, FAT, tar-extracted files)."""
+        sample = {}
+        for e in scan.entries.values():
+            ms = sample.setdefault(e.dev, [])
+            if len(ms) < 50:
+                ms.append(e.mtime_ns)
+        out = {}
+        for dev, ms in sample.items():
+            tick = self._base_tick(dev)
+            for coarse in (2_000_000_000, 1_000_000_000):
+                if all(m % coarse == 0 for m in ms):
+                    tick = max(tick, coarse)
+                    break
+            out[dev] = self._window(tick)
+        return out
 
     def _detect(self, scan, now, prev):
         """Turn stat changes into settle timers; read and hash every file that has settled."""
@@ -1424,17 +1546,23 @@ class WatchCore:
             read_ns = self.wall_ns()
             r = self.proj.read_entry(rel)
             if r.status == 'ok' and _skey(r.entry) == c[0] and sha(r.data) == c[1]:
-                if e.mtime_ns >= read_ns - self._racy_ns:
+                if e.mtime_ns >= read_ns - self._racy_for(e):
                     self.recheck.add(rel)
                 continue
             self._changed(rel, now, False, False)
         for rel, e in entries.items():
-            if rel not in self.tracks and e.mtime_ns >= scan.started_ns - self._racy_ns:
+            if rel not in self.tracks and e.mtime_ns >= scan.started_ns - self._racy_for(e):
                 self.recheck.add(rel)
-        # vanished local files: forget them, keep their inode for move detection
+        # vanished local files: forget them; keep a synced one's inode for move detection,
+        # forget a never-synced one entirely (editor temp names would pile up forever)
+        with self.lock:
+            synced = set(self.synced)
         for rel, p in prev.items():
             if rel not in entries and not _under(rel, scan.unreadable):
-                self.gone[rel] = (p.ino, p.dev)
+                if rel in synced:
+                    self.gone[rel] = (p.ino, p.dev)
+                else:
+                    self.last_change.pop(rel, None)
                 self.cache.pop(rel, None)
                 self.tracks.pop(rel, None)
                 self.bad.pop(rel, None)
@@ -1455,13 +1583,14 @@ class WatchCore:
                 self._store(rel, r.entry, r.data, read_ns)
                 self.bad.pop(rel, None)
                 del self.tracks[rel]
-            elif r.status in ('ok', 'unstable'):
-                t.last = now                        # still being written: wait again
+            elif r.status in ('ok', 'unstable', 'vanished'):
+                t.last = now                        # still being written, or listed but
+                                                    # mid-rename: wait; a scan that no
+                                                    # longer lists it drops the track
             else:
                 del self.tracks[rel]
                 self.cache.pop(rel, None)
-                if r.status != 'vanished':
-                    self.bad[rel] = r.status
+                self.bad[rel] = r.status
 
     def _decide(self, scan, now):
         """Desired (disk) versus last-known Looker state: holds, then at most one batch."""
@@ -1471,6 +1600,14 @@ class WatchCore:
             held_remote = dict(self.held_remote)
             busy = self.inflight is not None
         keep = set()
+        for rel in [r for r in self.gone if r not in synced]:
+            del self.gone[rel]
+        stuck = sorted(r for r, t in self.tracks.items()
+                       if r in entries and now >= t.first + self.MAX_WAIT)
+        if stuck:
+            keep.add('busy')
+            self._emit_hold('busy', f'{len(stuck)} file(s) still being written after '
+                            f'{self.MAX_WAIT:.0f} s; pushing once they hold still', stuck)
         bad = sorted(f'{r} ({s})' for r, s in self.bad.items() if r in entries)
         if bad:
             keep.add('unreadable')
@@ -1628,10 +1765,375 @@ class WatchCore:
                 self.inflight = None
 
 
+# ---------------------------------------------------------------- watch network
+#
+# Wires WatchCore to Looker. One save: conflict read (started when the path first changed, so
+# it overlaps the settle wait), the write, an `ack` line; then a read-back on another thread
+# prints `verified` or MISMATCH, and only verified bytes reach state.json. A background loop
+# confirms dev mode and the branch on its own connection; a mismatch pauses the core.
+
+GATE_HINT = '(fix it, or run `looker-sync push` to send it anyway)'
+
+
+class WatchNet:
+    BRANCH_EVERY = 5.0       # seconds between background branch checks
+    BRANCH_STALE = 30.0      # hold every write when the branch is unconfirmed this long
+    QUIET = 2.0              # --validate: seconds without a write before validating
+    PREFETCH_MAX_AGE = 10.0  # an older read-ahead is read again
+
+    def __init__(self, proj, sess, force=False, validate=False, verbose=False, poll=0.05,
+                 write_line=None, **core_kw):
+        if sess.mode != 'dev':
+            raise Refused('watch is refused in prod mode; switch --mode dev first')
+        self.proj, self.sess, self.L = proj, sess, sess.L
+        self.branch = proj.require_config().get('branch')
+        self.force, self.validate, self.verbose = force, validate, verbose
+        self.write_line = write_line or (lambda s: print(s, flush=True))
+        self.lock = threading.RLock()
+        self.print_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.known = dict(proj.state.get('files', {}))   # rel -> sha Looker holds as far as we know
+        self.gen = {}            # rel -> count of acked writes
+        self.mismatch = {}       # rel -> sha Looker kept after a read-back mismatch
+        self.prefetch = {}       # rel -> (monotonic start, gen at start, Future)
+        self.reasons = {}        # pause key -> text
+        self.writes_since_check = 0
+        self.checked_at = time.monotonic()   # open_session just confirmed the branch
+        self.attempted_at = self.checked_at  # last check started, whatever its outcome
+        self.check_notice = None             # last failure notice, printed once until it changes
+        self.last_write, self.to_validate = 0.0, False
+        self.validations = 0
+        self.stop_event = threading.Event()
+        self.kick = threading.Event()
+        self.verify_q = queue.Queue()
+        self.reader = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix='watch-read')
+        self.threads = []
+        self.core = WatchCore(proj, self.push_one, remote_state=lambda: dict(self.known),
+                              on_event=self.on_event, hold_check=self.hold_check,
+                              on_change=self.on_change, poll=poll, **core_kw)
+        self.L.before_token_swap = self._before_swap
+        self.L.on_refresh_error = lambda e: self.line('notice', f'token refresh failed ({e}); retrying')
+
+    # ---- output
+
+    def line(self, kind, text):
+        stamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        with self.print_lock:
+            self.write_line(f'{stamp} {kind:<8} {text}')
+
+    def on_event(self, kind, text, paths=()):
+        if kind == 'pushed':
+            return                   # push_one already printed `ack`
+        gate = kind == 'held' and text.startswith('syntax error')
+        self.line(kind, text)
+        for p in paths:
+            self.line(kind, f'  {p} {GATE_HINT}' if gate else f'  {p}')
+
+    # ---- pause reasons (branch, auth) on top of the core's own
+
+    def _pause(self, key, text):
+        with self.lock:
+            self.reasons[key] = text
+            self.prefetch.clear()    # a read-ahead from another branch or session proves nothing
+            joined = '; '.join(self.reasons[k] for k in sorted(self.reasons))
+        self.core.pause(joined)
+
+    def _unpause(self, key):
+        with self.lock:
+            if self.reasons.pop(key, None) is None:
+                return
+            self.prefetch.clear()
+            joined = '; '.join(self.reasons[k] for k in sorted(self.reasons))
+        if joined:
+            self.core.pause(joined)
+        else:
+            self.core.resume()
+
+    # ---- Looker reads
+
+    def _read_remote(self, rel, token=None):
+        st, payload = self.L.try_call('GET', f'/projects/{self.sess.project}/file/content',
+                                      {'file_path': rel}, raw=True, token=token)
+        if st == 404:
+            return None
+        if st >= 400:
+            raise LookerError(f'GET {rel} -> HTTP {st}: {payload}')
+        return payload
+
+    def on_change(self, rel):
+        """Start the conflict read as soon as a path changes, in parallel with its settle wait."""
+        if self.stop_event.is_set():
+            return
+        if rel not in self.core.cache and rel in self.known:
+            return                   # the first scan meets every synced file: no read storm
+        with self.lock:
+            # always a new read: a new track means the remote may have moved since any older one
+            try:
+                fut = self.reader.submit(self._read_remote, rel)
+            except RuntimeError:     # shutting down
+                return
+            self.prefetch[rel] = (time.monotonic(), self.gen.get(rel, 0), fut)
+
+    def _conflict_read(self, rel):
+        with self.lock:
+            p = self.prefetch.pop(rel, None)
+            fresh = p and p[1] == self.gen.get(rel, 0) and time.monotonic() - p[0] < self.PREFETCH_MAX_AGE
+        if fresh:
+            try:
+                return p[2].result()
+            except LookerError:
+                pass                 # read it again below; a real failure raises there
+        return self._read_remote(rel)
+
+    # ---- the core's push_one
+
+    def push_one(self, rel, data):
+        """None once Looker acknowledged the write; a reason to hold; raises to retry."""
+        if self.sess.mode != 'dev':
+            raise Refused('watch never writes in prod mode')
+        with self.lock:
+            paused = '; '.join(self.reasons.values())
+        if paused:
+            raise LookerError(f'not written while paused: {paused}')
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            return 'not UTF-8 text, which Looker cannot store'
+        del text
+        try:
+            remote = self._conflict_read(rel)
+            h, rh = sha(data), sha(remote)
+            with self.lock:
+                known, kept = self.known.get(rel), self.mismatch.get(rel)
+            if rh == h:              # Looker already holds these bytes
+                with self.lock:
+                    self.known[rel] = h
+                    self.mismatch.pop(rel, None)
+                self._record(rel, h)
+                self.line('verified', f'{rel} (already in Looker)')
+                return None
+            if rh != known and not self.force:
+                if kept is not None and rh == kept:
+                    return ('Looker kept different bytes than were sent (MISMATCH); check it in '
+                            'the Looker IDE, then pull, or push --force')
+                if remote is None:
+                    return 'deleted in Looker since last sync; pull, or push --force to write it again'
+                return 'changed in Looker since last sync; pull it, or push --force to overwrite it'
+            self.sess.write(rel, data, exists=remote is not None)
+        except AuthExpired as e:
+            self._pause('auth', f'Looker refused the session ({e}); paused, logging in again '
+                        f'every {self.BRANCH_EVERY:.0f} s')
+            self.kick.set()
+            raise
+        with self.lock:
+            g = self.gen[rel] = self.gen.get(rel, 0) + 1
+            self.known[rel] = h
+            self.writes_since_check += 1
+            self.last_write, self.to_validate = time.monotonic(), True
+        self.line('ack', rel)
+        self.verify_q.put((rel, h, g))
+        return None
+
+    def _record(self, rel, h):
+        with self.state_lock:
+            record(self.proj, self.sess, {rel: h})
+
+    # ---- read-back and --validate
+
+    def _verify_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                rel, h, g = self.verify_q.get(timeout=0.1)
+            except queue.Empty:
+                self._maybe_validate()
+                continue
+            with self.lock:
+                if self.gen.get(rel) != g:
+                    continue         # a newer write of rel is queued; verify that one
+            try:
+                back = self._read_remote(rel)
+            except LookerError as e:
+                self.line('error', f'{rel}: read-back failed ({e}); not recorded as synced')
+                continue
+            bh = sha(back)
+            with self.lock:
+                current = self.gen.get(rel) == g
+            if bh == h:
+                self._record(rel, h)
+                self.line('verified', rel)
+            elif current:
+                with self.lock:
+                    self.known[rel] = (self.proj.state.get('files') or {}).get(rel)
+                    self.mismatch[rel] = bh
+                self.core.set_remote(rel, bh)   # local differs again: the next push holds it
+                self.line('MISMATCH', f'{rel}: Looker holds different bytes than were sent')
+
+    def _maybe_validate(self):
+        with self.lock:
+            due = (self.validate and self.to_validate and self.verify_q.empty()
+                   and time.monotonic() - self.last_write >= self.QUIET)
+            if due:
+                self.to_validate = False
+        if not due:
+            return
+        self.validations += 1
+        try:
+            with self.print_lock:
+                self.sess.validate(verbose=self.verbose)
+        except LookerError as e:
+            self.line('error', f'validation failed: {e}')
+
+    # ---- branch and dev mode
+
+    def check_branch(self, token=None):
+        """None when Looker is in dev mode on the configured branch, else why not."""
+        st, s = self.L.try_call('GET', '/session', token=token)
+        if st == 401:                # only with `token`: a refused new session
+            raise AuthExpired('GET /session -> HTTP 401 on a new login')
+        if st >= 400:
+            raise LookerError(f'GET /session -> HTTP {st}: {s}')
+        ws = (s or {}).get('workspace_id')
+        if ws != 'dev':
+            return f'the Looker session is in {ws!r}, not dev mode'
+        st, b = self.L.try_call('GET', f'/projects/{self.sess.project}/git_branch', token=token)
+        if st == 401:
+            raise AuthExpired('GET git_branch -> HTTP 401 on a new login')
+        if st >= 400:
+            raise LookerError(f'GET git_branch -> HTTP {st}: {b}')
+        name = (b or {}).get('name')
+        if name != self.branch:
+            return f"Looker's dev workspace is on branch {name!r}, not {self.branch!r}"
+        if (b or {}).get('readonly'):
+            return f'Looker reports branch {name!r} as read-only for you'
+        return None
+
+    def branch_tick(self):
+        with self.lock:
+            writes, self.writes_since_check = self.writes_since_check, 0
+            self.attempted_at = time.monotonic()
+        try:
+            reason = self.check_branch()
+        except AuthExpired as e:
+            self._pause('auth', f'Looker refused the session ({e}); paused, logging in again '
+                        f'every {self.BRANCH_EVERY:.0f} s')
+            return
+        except LookerError as e:
+            with self.lock:
+                self.writes_since_check += writes
+                text = f'branch check failed ({e}); trying again'
+                repeat, self.check_notice = text == self.check_notice, text
+            if not repeat:
+                self.line('notice', text)
+            return
+        with self.lock:
+            self.check_notice = None
+        self._unpause('auth')
+        with self.lock:
+            self.checked_at = time.monotonic()
+            was = 'branch' in self.reasons
+        if reason:
+            if writes and not was:
+                self.line('error', f'{writes} write(s) since the previous check may have landed on '
+                          'that branch; check it in the Looker IDE')
+            self._pause('branch', f'{reason}; switch it back in the Looker IDE (or run '
+                        '`looker-sync switch`)')
+        else:
+            self._unpause('branch')
+
+    def _branch_loop(self):
+        while not self.stop_event.is_set():
+            self.kick.wait(self.BRANCH_EVERY)
+            self.kick.clear()
+            if self.stop_event.is_set():
+                return
+            self.branch_tick()
+
+    def hold_check(self):
+        """Before every batch: kick a check when the last one is old; hold when it is stale."""
+        now = time.monotonic()
+        age = now - self.checked_at
+        if now - self.attempted_at > self.BRANCH_EVERY:
+            self.kick.set()
+        if age > self.BRANCH_STALE:
+            return f'branch not confirmed for {age:.0f} s (is Looker reachable?)'
+        return None
+
+    def _before_swap(self, token):
+        """A token refresh: the new session must be in dev mode on the branch, else keep the old."""
+        reason = self.check_branch(token=token)
+        if reason:
+            self._pause('branch', f'{reason} (seen on a token refresh)')
+            raise LookerError(reason)
+
+    # ---- life cycle
+
+    def start(self):
+        self.L.start_auto_refresh()
+        self.threads = [threading.Thread(target=self._verify_loop, daemon=True, name='watch-verify'),
+                        threading.Thread(target=self._branch_loop, daemon=True, name='watch-branch')]
+        for t in self.threads:
+            t.start()
+        self.core.start()
+
+    def close(self):
+        self.core.stop()
+        self.stop_event.set()
+        self.kick.set()
+        for t in self.threads:
+            t.join(5)
+        self.reader.shutdown(wait=True, cancel_futures=True)
+        self.L.close()
+
+    def run(self):
+        """Watch until Ctrl-C; returns OK."""
+        self.line('notice', f'watching {self.proj.root} -> branch {self.branch}'
+                  f'{" (--force: overwrites Looker edits)" if self.force else ""}; Ctrl-C stops')
+        self.start()
+        try:
+            while not self.stop_event.wait(0.5):
+                pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.close()
+            self.line('notice', 'stopped')
+        return OK
+
+
+def cmd_watch(proj, args):
+    cfg = proj.require_config()
+    if cfg.get('mode') != 'dev':
+        raise Refused('watch is refused in prod mode; switch --mode dev first')
+    if args.poll < 10:
+        raise Refused('--poll is in milliseconds and must be at least 10')
+    sess = open_session(proj, args, fetch=False)
+    drift_guard(proj, sess, 'watch', refuse=True)
+    if (getattr(sess, 'branch_info', None) or {}).get('readonly'):
+        raise Refused(f'Looker reports branch {sess.branch!r} as read-only for you; '
+                      'switch to a branch of your own to watch')
+    w = WatchNet(proj, sess, force=args.force, validate=args.validate, verbose=args.verbose,
+                 poll=args.poll / 1000.0)
+    return w.run()
+
+
 # ---------------------------------------------------------------- commands
+
+def case_collisions(paths):
+    """Groups of paths that differ only by case: one file on a case-insensitive volume."""
+    groups = {}
+    for p in paths:
+        groups.setdefault(p.casefold(), []).append(p)
+    return [sorted(g) for g in groups.values() if len(g) > 1]
+
 
 def do_pull(proj, sess, force=False, dry_run=False):
     local, remote = proj.local_files(), sess.remote_files()
+    clashes = case_collisions(remote)
+    if clashes:                         # refused on every OS: the clone may move to a Mac
+        raise Refused('Looker has files whose paths differ only by case, which a Mac or '
+                      'Windows folder cannot hold apart: '
+                      + '; '.join(' and '.join(g) for g in sorted(clashes))
+                      + '. Rename one of each in Looker, then pull again. Nothing written.')
     kinds = plan(local, remote, proj.state.get('files', {}))
     blocked = [p for p, k in kinds.items() if k == 'conflict' and p in remote]
     writes = [p for p, k in kinds.items() if k in ('remote-new', 'remote-modified')]
@@ -1804,7 +2306,22 @@ def cmd_status(proj, args):
     return OK
 
 
-def do_push(proj, sess, force=False, delete=False, dry_run=False):
+def push_reads(local, listed, known):
+    """The Looker files push must read: only those it may write or delete.
+
+    A file is read when it changed locally since the last sync (its local hash differs from
+    state.json, a new local file included) and Looker lists it, or when it was deleted locally
+    and Looker still lists it. Every other listed file is unchanged locally, so push leaves it
+    alone whatever Looker holds; reading it could only add a refusal about a file push never
+    touches. Presence alone (listed or not) settles remote-new and remote-deleted.
+    """
+    return sorted(p for p in listed
+                  if (sha(local[p]) != known.get(p) if p in local else p in known))
+
+
+def do_push(proj, sess, force=False, delete=False, dry_run=False, validate=True, verbose=False,
+            phases=None):
+    phases = phases or Phases()
     if sess.mode != 'dev':
         raise Refused('push is refused in prod mode; switch --mode dev first')
     # Not verified live with two users (a non-admin cannot see a project with no model in
@@ -1812,8 +2329,19 @@ def do_push(proj, sess, force=False, delete=False, dry_run=False):
     if (getattr(sess, 'branch_info', None) or {}).get('readonly'):
         raise Refused(f'Looker reports branch {sess.branch!r} as read-only for you, as a colleague\'s '
                       'personal branch is; review it, then switch to a branch of your own to push')
-    local, remote = proj.local_files(), sess.remote_files()
-    kinds = plan(local, remote, proj.state.get('files', {}))
+    known = proj.state.get('files', {})
+    with phases('local scan'):
+        local = proj.local_files()
+    with phases('file list'):
+        listed = {f['path'] for f in sess.file_list() if proj.synced(f['path'])}
+    need = push_reads(local, listed, known)
+    with phases('remote reads', f'{len(need)} of {len(listed)} file(s)'):
+        remote = dict(zip(need, sess.L.read_files(sess.project, need))) if need else {}
+    # a listed file left unread is unchanged locally: plan it as unchanged in Looker too, so it
+    # is never written; one not in state and not local is remote-new, which needs no bytes
+    remote_h = {p: sha(remote[p]) if p in remote else known.get(p) or 'listed, not read'
+                for p in listed}
+    kinds = plan_hashes({p: sha(d) for p, d in local.items()}, remote_h, known)
     show(kinds, 'push plan')
     guarded = [p for p, k in kinds.items() if k in REMOTE_CHANGED]
     if guarded and not force:
@@ -1833,11 +2361,12 @@ def do_push(proj, sess, force=False, delete=False, dry_run=False):
     # New files first: a changed file (an include:) is more likely to reference a new one than the
     # reverse, so stopping halfway leaves Looker valid. Each write is read back and recorded at once,
     # so a failure later in the run never makes the next push see our own writes as Looker edits.
-    writes.sort(key=lambda p: p in remote)
+    writes.sort(key=lambda p: p in listed)
     done, verified, bad = [], {}, []
+    started = time.perf_counter()
     try:
         for p in writes:
-            sess.write(p, local[p], exists=p in remote)
+            sess.write(p, local[p], exists=p in listed)
             done.append(p)
             out(f'  wrote {p}')
             back = sess.read(p)
@@ -1856,22 +2385,36 @@ def do_push(proj, sess, force=False, delete=False, dry_run=False):
         out('  written: ' + (', '.join(done) or '(none)'))
         out('  not written: ' + (', '.join(p for p in writes + deletes if p not in done) or '(none)'))
         raise
+    finally:
+        phases.note('write+read-back', time.perf_counter() - started,
+                    f'{len(writes)} write(s), {len(deletes)} delete(s)')
     updates = in_sync(local, remote)
     updates.update(verified)
     record(proj, sess, updates, drops=deletes)
     out(f'read-back: {len(verified)}/{len(writes)} byte-equal')
     for p in bad:
         out(f'  MISMATCH {p}: Looker holds different bytes than were sent')
-    errors = sess.validate() if (writes or deletes) else 0
+    errors = 0
+    if (writes or deletes) and not validate:
+        out('validation: skipped (--no-validate)')
+    elif writes or deletes:
+        with phases('validate'):
+            errors = sess.validate(verbose=verbose)
     if bad:
         return LOOKER_ERROR
     return INVALID if errors else OK
 
 
 def cmd_push(proj, args):
-    sess = open_session(proj, args)
-    drift_guard(proj, sess, 'push', refuse=True)
-    return do_push(proj, sess, args.force, args.delete, args.dry_run)
+    phases = Phases(args.verbose)
+    try:
+        sess = open_session(proj, args, fetch=False, phases=phases)
+        with phases('drift guard'):
+            drift_guard(proj, sess, 'push', refuse=True)
+        return do_push(proj, sess, args.force, args.delete, args.dry_run, validate=not args.no_validate,
+                       verbose=args.verbose, phases=phases)
+    finally:
+        phases.total()
 
 
 def ask(question, choices):
@@ -2136,6 +2679,14 @@ def main(argv=None):
     p.add_argument('--force', action='store_true', help='overwrite files changed in Looker since the last sync')
     p.add_argument('--delete', action='store_true', help='delete files that exist only in Looker')
     p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--no-validate', action='store_true', help='skip Looker validation after writing')
+    p.add_argument('--verbose', action='store_true',
+                   help='time each step on stderr; show info-severity validation lines')
+    p = sub.add_parser('watch', help='push each local save to Looker as it happens; never deletes')
+    p.add_argument('--validate', action='store_true', help='validate in Looker after writes go quiet')
+    p.add_argument('--verbose', action='store_true', help='show info-severity validation lines')
+    p.add_argument('--poll', type=int, default=50, metavar='MS', help='scan interval in ms (default 50)')
+    p.add_argument('--force', action='store_true', help='overwrite files changed in Looker since the last sync')
     p = sub.add_parser('switch', help='move Looker and the folder to another branch or mode')
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--branch')
@@ -2153,7 +2704,8 @@ def main(argv=None):
     proj = Project(args.project_dir)
     try:
         return {'init': cmd_init, 'link': cmd_link, 'pull': cmd_pull, 'status': cmd_status,
-                'push': cmd_push, 'switch': cmd_switch}[args.cmd](proj, args)
+                'push': cmd_push, 'switch': cmd_switch,
+                'watch': cmd_watch}[args.cmd](proj, args)
     except Refused as e:
         out(f'REFUSED: {e}')
         return REFUSED

@@ -1533,6 +1533,133 @@ def _unblock_fifo(path):
         pass
 
 
+class FastPushTest(FakeLookerTestCase):
+    """push reads only the files it may write or delete; --no-validate and --verbose."""
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+        self.fake.log.clear()   # init read every file; count only what push does
+
+    def reads(self, before_write=False):
+        """GET file/content calls in the log; before_write stops at the first file write."""
+        n = 0
+        for method, path, _, _ in self.fake.log:
+            if before_write and method in ('POST', 'PUT', 'DELETE') and path.endswith('/files'):
+                break
+            n += method == 'GET' and path.endswith('/file/content')
+        return n
+
+    def test_no_change_push_reads_no_file_and_one_change_reads_only_that_file(self):
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('push plan: nothing differs', r.stdout)
+        self.assertEqual(self.reads(), 0)
+        self.assertEqual(self.writes(), [])
+        self.fake.log.clear()
+        self.put_local('views/orders.view.lkml', 'view: orders { dimension: id {} }\n')
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.reads(before_write=True), 1)   # the guard's read of the changed file
+        self.assertEqual(self.reads(), 2)                    # plus its read-back
+        self.assertIn('read-back: 1/1 byte-equal', r.stdout)
+
+    def test_file_changed_only_in_looker_does_not_block_pushing_another(self):
+        self.fake.dev_write('models/demo.model.lkml', 'connection: "ide"\n')
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.fake.dev_files()['views/orders.view.lkml'], 'view: orders { # mine\n}\n')
+        self.assertEqual(self.fake.dev_files()['models/demo.model.lkml'], 'connection: "ide"\n')   # left alone
+        self.assertEqual(self.local('models/demo.model.lkml'), 'connection: "db"\n')
+        # status still reads everything and reports Looker's change
+        r = self.run_cli('status')
+        self.assertIn('models/demo.model.lkml', r.stdout)
+
+    def test_file_changed_on_both_sides_is_still_refused(self):
+        self.fake.dev_write('views/orders.view.lkml', 'view: orders { # ide\n}\n')
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn('changed in Looker since the last sync: views/orders.view.lkml', r.stdout)
+        self.assertEqual(self.writes(), [])
+
+    def test_file_deleted_in_looker_is_still_refused(self):
+        self.fake.dev_write('views/orders.view.lkml', None)
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn('changed in Looker since the last sync: views/orders.view.lkml', r.stdout)
+        self.assertEqual(self.writes(), [])
+        self.assertNotIn('views/orders.view.lkml', self.fake.dev_files())
+
+    def test_no_validate_skips_validation(self):
+        self.put_local('views/orders.view.lkml', 'view: orders { dimension: id {} }\n')
+        r = self.run_cli('push', '--no-validate')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('validation: skipped (--no-validate)', r.stdout)
+        self.assertFalse(any(p.endswith('/validate') for _, p, _, _ in self.fake.log))
+        self.assertIn('read-back: 1/1 byte-equal', r.stdout)
+
+    def test_verbose_prints_timings_and_info_lines_hidden_without_it(self):
+        self.fake.validation_errors = [{'severity': 'info', 'message': 'a note from the validator',
+                                        'file_path': 'views/orders.view.lkml', 'line_number': 1}]
+        self.put_local('views/orders.view.lkml', 'view: orders { dimension: id {} }\n')
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('a note from the validator', r.stdout)
+        self.assertIn('validation: no errors (1 info line(s) hidden; --verbose shows them)', r.stdout)
+        self.assertNotIn('timing:', r.stdout + r.stderr)
+        self.put_local('views/orders.view.lkml', 'view: orders { dimension: id {} dimension: n {} }\n')
+        r = self.run_cli('push', '--verbose')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('a note from the validator', r.stdout)
+        self.assertNotIn('hidden', r.stdout)
+        self.assertNotIn('timing:', r.stdout)
+        timings = [line.split()[1] for line in r.stderr.splitlines() if line.startswith('timing:')]
+        for label in ('session', 'file', 'remote', 'validate', 'total'):
+            self.assertIn(label, timings, r.stderr)
+
+
+class FastPushFetchTest(GitTestCase):
+    """push skips git fetch when the clone's last-fetched refs already prove Looker's commit."""
+
+    def setUp(self):
+        super().setUp()
+        r = self.init()   # a clone without a terminal: init links origin
+        self.assertEqual(self.config()['git_remote'], 'origin', r.stdout)
+
+    def fetches(self):
+        return sum(a[0] == 'fetch' for a in self.git_calls())
+
+    def run_ok(self, *args):
+        r = self.run_cli(*args)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r
+
+    def test_push_skips_fetch_when_the_commit_is_already_fetched(self):
+        n = self.fetches()
+        self.put_local('views/orders.view.lkml', 'view: orders { # mine\n}\n')
+        self.run_ok('push')
+        self.run_ok('push')
+        self.assertEqual(self.fetches(), n)
+
+    def test_push_fetches_when_looker_moved_and_still_passes(self):
+        n = self.fetches()
+        files = dict(self.fake.branches['feat'], **{'views/users.view.lkml': 'view: users {}\n'})
+        sha = self.repos.commit('feat', files)    # Looker commits and pushes; the clone has not fetched
+        self.assertNotEqual(self.git_try('cat-file', '-e', sha + '^{commit}').returncode, 0)
+        self.run_ok('push')
+        self.assertEqual(self.fetches(), n + 1)
+        self.assertEqual(self.git('rev-parse', 'origin/feat'), sha)
+
+    def test_status_and_switch_still_fetch_every_time(self):
+        n = self.fetches()
+        self.run_ok('status')
+        self.assertEqual(self.fetches(), n + 1)
+        self.run_ok('switch', '--branch', 'master', '--force')
+        self.assertGreater(self.fetches(), n + 1)
+
+
 class LocalScanTest(unittest.TestCase):
     """scan_tree / read_stable / Project.local_files on awkward folders, no Looker involved."""
 
@@ -2539,6 +2666,528 @@ class WatchWorkerTest(WatchCoreTestCase):
             latest = f.read()
         self.assertEqual(len(pushes), 2)
         self.assertEqual(pushes[-1], latest)
+
+
+class WatchMacSaveTest(WatchCoreTestCase):
+    """Editor-style atomic saves (temp file, junk names, rename onto the target) as seen on
+    macOS: every save must reach Looker, and nothing may be held or skipped in silence."""
+
+    TARGET = 'base/b0.view.lkml'
+    JUNK = ('.b0.view.lkml.swp', '4913', 'b0.view.lkml~', '#b0.view.lkml#', '._b0.view.lkml',
+            'b0.view.lkml___jb_tmp___', '.DS_Store', 'b0.view.lkml.orig')
+
+    def remap_inodes(self):
+        """A new file takes the most recently freed inode, as APFS and others may do."""
+        proj, real_scan, real_read = self.c.proj, self.c.proj.scan, self.c.proj.read_entry
+        fake, freed, live = {}, [], set()
+
+        def ino(real):
+            if real not in fake:
+                fake[real] = freed.pop() if freed else real
+            return fake[real]
+
+        def scan(previous=None):
+            sc = real_scan(previous=previous)
+            entries = {r: e._replace(ino=ino(e.ino)) for r, e in sc.entries.items()}
+            now = set(e.ino for e in entries.values())
+            freed.extend(sorted(live - now))
+            for real in [k for k, v in fake.items() if v in live - now]:
+                del fake[real]
+            live.clear()
+            live.update(now)
+            return sc._replace(entries=entries)
+
+        def read_entry(rel):
+            r = real_read(rel)
+            if r.entry is None:
+                return r
+            return r._replace(entry=r.entry._replace(ino=ino(r.entry.ino)))
+        proj.scan, proj.read_entry = scan, read_entry
+
+    def rounds(self, gap, step, see_tmp, reuse=False, n=10):
+        """n saves `gap` s apart, a tick every `step` s. see_tmp(i): a tick lands between
+        writing the temp file and renaming it. Returns the time of the last rename."""
+        self.put(self.TARGET, 'view: b0 { # start\n}\n', synced=True)
+        self.core()
+        if reuse:
+            self.remap_inodes()
+        self.at(0)
+        base = os.path.join(self.root, 'base')
+        t, last, i = step, None, 0
+        while i < n:
+            if t >= 1.0 + i * gap:
+                for name in self.JUNK:
+                    self.put('base/' + name, f'junk {i}\n', old=False)
+                self.put(f'base/tmpXY{i}.lkml', f'scratch {i}\n', old=False)
+                self.put('base/tmpsave.lkml', f'view: b0 {{ # v{i:02d}\n}}\n', old=False)
+                if see_tmp(i):
+                    self.at(t)
+                    t += step
+                os.replace(os.path.join(base, 'tmpsave.lkml'), os.path.join(base, 'b0.view.lkml'))
+                os.unlink(os.path.join(base, f'tmpXY{i}.lkml'))
+                last, i = t, i + 1
+            self.at(t)
+            t += step
+        return last, t
+
+    def versions(self):
+        self.assertEqual(set(r for r, _ in self.pushes), {self.TARGET})
+        return [d.split('# ')[1].split('\n')[0] for _, d in self.pushes]
+
+    def finish(self, t, until):
+        while t <= until:
+            self.at(t)
+            t += 0.115
+
+    def check_spaced(self, see_tmp, reuse=False):
+        last, t = self.rounds(1.5, 0.1, see_tmp, reuse)
+        self.finish(t, last + 1.0)
+        self.assertEqual(self.versions(), [f'v{i:02d}' for i in range(10)])
+        self.assertEqual(self.kinds('held'), [])
+
+    def check_mac_paced(self, see_tmp, reuse=False):
+        last, t = self.rounds(0.65, 0.115, see_tmp, reuse)
+        during = len(self.pushes)
+        self.finish(t, last + 3.2)
+        self.assertGreaterEqual(during, 1)                 # a busy writer is never starved
+        self.assertEqual(self.versions()[-1], 'v09')       # the last save always lands
+        self.assertEqual(self.versions(), sorted(self.versions()))
+        self.assertEqual(self.kinds('held'), [])
+
+    def test_spaced_saves_temp_seen_every_round(self):
+        self.check_spaced(lambda i: True)
+
+    def test_spaced_saves_temp_never_seen(self):
+        self.check_spaced(lambda i: False)
+
+    def test_spaced_saves_temp_seen_every_other_round(self):
+        self.check_spaced(lambda i: i % 2 == 0)
+
+    def test_spaced_saves_with_inode_reuse(self):
+        self.check_spaced(lambda i: True, reuse=True)
+
+    def test_spaced_saves_with_inode_reuse_alternate(self):
+        self.check_spaced(lambda i: i % 2 == 1, reuse=True)
+
+    def test_mac_paced_saves_temp_seen_every_round(self):
+        self.check_mac_paced(lambda i: True)
+
+    def test_mac_paced_saves_temp_never_seen(self):
+        self.check_mac_paced(lambda i: False)
+
+    def test_mac_paced_saves_temp_seen_every_other_round(self):
+        self.check_mac_paced(lambda i: i % 2 == 0)
+
+    def test_mac_paced_saves_with_inode_reuse(self):
+        self.check_mac_paced(lambda i: True, reuse=True)
+
+
+class WatchReadRetryTest(WatchCoreTestCase):
+
+    def flaky_read(self, rel, status, times):
+        real, left = self.c.proj.read_entry, [times]
+
+        def read_entry(r):
+            if r == rel and left[0] != 0:
+                left[0] -= 1
+                return self.cli.ReadResult(status, None, None)
+            return real(r)
+        self.c.proj.read_entry = read_entry
+
+    def test_listed_file_that_reads_as_vanished_is_retried(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        with open(full, 'ab') as f:
+            f.write(b'# more\n')
+        self.at(5.0)
+        self.flaky_read('a.view.lkml', 'vanished', 1)     # mid-rename on a Mac volume
+        self.assertIsNone(self.at(5.2))                   # settles again: 5.2 + 0.15
+        self.assertEqual(self.at(5.4), {'a.view.lkml': b'view: a {}\n# more\n'})
+        self.assertEqual(self.kinds('held'), [])
+
+    def test_file_that_never_holds_still_is_reported_busy(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        with open(full, 'ab') as f:
+            f.write(b'# more\n')
+        self.at(5.0)
+        self.flaky_read('a.view.lkml', 'unstable', -1)
+        for t in (5.2, 6.0, 7.0, 7.9):
+            self.assertIsNone(self.at(t))
+        self.assertEqual(self.held('still being written'), [])
+        self.assertIsNone(self.at(8.0))
+        busy = self.held('still being written')
+        self.assertEqual(len(busy), 1)
+        self.assertEqual(busy[0][2], ('a.view.lkml',))
+        self.assertIsNone(self.at(8.2))
+        self.assertEqual(len(self.held('still being written')), 1)   # once, not every tick
+        del self.c.proj.read_entry                          # the writer stops
+        self.assertEqual(self.at(8.4), {'a.view.lkml': b'view: a {}\n# more\n'})
+        self.assertEqual([e[1] for e in self.kinds('released')], [busy[0][1]])
+
+
+class WatchForgetTest(WatchCoreTestCase):
+
+    def test_vanished_temp_names_are_forgotten(self):
+        self.core()
+        self.at(0)
+        t = 1.0
+        for i in range(20):
+            full = self.put(f'tmp{i}.lkml', f'x {i}\n', old=False)
+            self.at(t)
+            os.unlink(full)
+            self.at(t + 0.05)
+            t += 0.1
+        self.assertEqual(self.c.gone, {})
+        self.assertEqual([r for r in self.c.last_change if r.startswith('tmp')], [])
+        self.assertEqual(self.pushes, [])
+
+    def test_deleted_synced_file_keeps_its_inode_until_looker_drops_it(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        os.unlink(full)
+        self.at(1.0)
+        self.assertIn('a.view.lkml', self.c.gone)
+        self.c.set_remote('a.view.lkml', None)
+        self.at(1.1)
+        self.assertEqual(self.c.gone, {})
+
+
+class WatchClockTest(WatchCoreTestCase):
+
+    def test_cycle_is_measured_and_sets_the_stall_test(self):
+        self.core(poll=0.05)
+        self.assertEqual(self.c.cycle, 0.05)
+        t = 0.0
+        for _ in range(30):
+            self.at(t)
+            t += 0.3
+        self.assertAlmostEqual(self.c.cycle, 0.3, places=2)
+        self.at(t + 2.2)                     # 10 cycles = 3 s: a slow laptop, not a stall
+        self.assertEqual([e for e in self.kinds('notice') if 'no scan' in e[1]], [])
+        cycle = self.c.cycle                 # one slow tick moves it by at most 40 %
+        self.assertLess(cycle, 0.3 * 1.41)
+        self.at(t + 2.2 + 6.0)
+        self.assertEqual(len([e for e in self.kinds('notice') if 'no scan' in e[1]]), 1)
+        self.assertEqual(self.c.cycle, cycle)   # a stall is not a cycle
+
+
+class WatchMtimeTickTest(WatchCoreTestCase):
+
+    def test_probe_measures_a_tick_and_cleans_up(self):
+        meta = os.path.join(self.root, '.looker-sync')
+        tick = self.cli.mtime_tick(meta)
+        self.assertGreater(tick, 0)
+        self.assertLess(tick, 2 * 10**9)
+        self.assertEqual(os.listdir(meta), ['config.json'])
+        self.assertEqual(self.cli.mtime_tick(meta, budget=0), 2 * 10**9)
+        self.assertEqual(self.cli.mtime_tick(os.path.join(self.root, 'nope')), 2 * 10**9)
+
+    def test_core_measures_once_and_window_follows_it(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        dev = os.stat(self.root).st_dev
+        self.assertEqual(self.c.meta_dev, dev)
+        self.assertEqual(self.c._racy[dev], max(2 * self.c.mtime_tick, 2_000_000))
+
+    def test_whole_second_mtimes_widen_the_window(self):
+        for i, step in enumerate((2, 1)):
+            for j in range(3):
+                full = self.put(f'v{i}{j}.view.lkml', 'view: v {}\n', synced=True)
+                even = (self.wall // 10**9 - 100) // 2 * 2       # odd + 1 for the 1 s case
+                t = (even - 2 * j + (step == 1)) * 10**9
+                os.utime(full, ns=(t, t))
+            self.core()
+            self.at(i)
+            self.assertEqual(self.c._racy[os.stat(self.root).st_dev], 2 * step * 10**9)
+            for j in range(3):
+                os.unlink(os.path.join(self.root, f'v{i}{j}.view.lkml'))
+
+
+class WatchCaseRenameTest(WatchCoreTestCase):
+
+    def test_case_only_rename_never_trusts_the_old_spelling(self):
+        old = self.put('b0.view.lkml', 'view: b0 {}\n', synced=True)
+        self.core()
+        self.at(0)
+        new = os.path.join(self.root, 'B0.view.lkml')
+        os.replace(old, new)
+        real_stat, real_lstat, real_exists = os.stat, os.lstat, os.path.exists
+
+        def lie(fn):
+            def wrapped(path, *a, **kw):
+                if os.fspath(path) == old:          # a case-insensitive volume answers
+                    return fn(new, *a, **kw)
+                return fn(path, *a, **kw)
+            return wrapped
+        reads, real_read = [], self.c.proj.read_entry
+
+        def read_entry(rel):
+            reads.append(rel)
+            return real_read(rel)
+        self.c.proj.read_entry = read_entry
+        with mock.patch('os.stat', lie(real_stat)), mock.patch('os.lstat', lie(real_lstat)), \
+                mock.patch('os.path.exists', lie(real_exists)):
+            self.at(5.0)
+            self.at(5.2)
+        self.assertEqual(self.pushes, [])
+        self.assertNotIn('b0.view.lkml', reads)
+        moves = self.held('moved')
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0][2], ('b0.view.lkml -> B0.view.lkml',))
+
+
+class PullCaseCollisionTest(FakeLookerTestCase):
+
+    def test_paths_differing_only_by_case_are_refused_on_every_os(self):
+        self.init()
+        self.fake.dev_write('views/Users.view.lkml', 'view: users_a {}\n')
+        self.fake.dev_write('views/users.view.lkml', 'view: users_b {}\n')
+        self.fake.dev_write('views/new.view.lkml', 'view: new {}\n')
+        for args in (['pull', '--dry-run'], ['pull'], ['pull', '--force']):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn('views/Users.view.lkml and views/users.view.lkml', r.stdout)
+        for name in ('Users.view.lkml', 'users.view.lkml', 'new.view.lkml'):
+            self.assertFalse(os.path.exists(os.path.join(self.dir, 'views', name)), name)
+
+class WatchNetTestCase(FakeLookerTestCase):
+    """WatchNet in this process against the fake: real threads, lines collected in a list."""
+
+    def setUp(self):
+        super().setUp()
+        self.cli = import_cli()
+        self.init()
+        self.lines = []
+        self.nets = []
+
+    def tearDown(self):
+        for w in self.nets:
+            w.close()
+        self.fake.drop_connections()
+        super().tearDown()
+
+    def watch(self, start=True, **kw):
+        import argparse
+        proj = self.cli.Project(self.dir)
+        sess = self.cli.open_session(proj, argparse.Namespace(env_file=None), fetch=False)
+        w = self.cli.WatchNet(proj, sess, write_line=self.lines.append, **kw)
+        self.nets.append(w)
+        if start:
+            w.start()
+            time.sleep(0.3)      # let the first scan take its baseline
+        return w
+
+    def wait_for(self, cond, seconds=10):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return cond()
+
+    def kinds(self, kind):
+        return [ln for ln in self.lines if ln.split()[1:2] == [kind]]
+
+    def has(self, kind, text=''):
+        return any(text in ln for ln in self.kinds(kind))
+
+    def state_sha(self, rel):
+        return self.cli.Project(self.dir).state.get('files', {}).get(rel)
+
+    def content_writes(self):
+        return [e for e in self.writes() if e[1].endswith('/files')]
+
+
+class WatchNetPushTest(WatchNetTestCase):
+    """One save: ack, then verified, and only verified bytes reach state.json."""
+
+    def test_save_prints_ack_then_verified_and_records(self):
+        self.watch()
+        rel, text = 'views/orders.view.lkml', 'view: orders { # watched\n}\n'
+        self.put_local(rel, text)
+        self.assertTrue(self.wait_for(lambda: self.has('verified', rel)), self.lines)
+        ack = next(i for i, ln in enumerate(self.lines) if ln.split()[1:3] == ['ack', rel])
+        ver = next(i for i, ln in enumerate(self.lines) if ln.split()[1:3] == ['verified', rel])
+        self.assertLess(ack, ver, self.lines)
+        self.assertRegex(self.lines[ack], r'^\d\d:\d\d:\d\d\.\d{3} ack      views/orders\.view\.lkml$')
+        self.assertEqual(self.fake.dev_files()[rel], text)
+        self.assertEqual(self.state_sha(rel), self.cli.sha(text.encode()))
+        self.assertEqual(len(self.content_writes()), 1)
+
+    def test_readback_mismatch_is_not_recorded_and_next_save_holds(self):
+        self.watch()
+        rel = 'views/orders.view.lkml'
+        before = self.state_sha(rel)
+        self.fake.mangle_readback.add(rel)
+        self.put_local(rel, 'view: orders { # one\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('MISMATCH', rel)), self.lines)
+        self.assertEqual(self.state_sha(rel), before)       # never recorded as synced
+        n = len(self.content_writes())
+        self.put_local(rel, 'view: orders { # two\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('held')), self.lines)
+        self.assertTrue(any('MISMATCH' in ln for ln in self.kinds('held')), self.lines)
+        self.assertEqual(len(self.content_writes()), n)      # held, not overwritten
+
+    def test_watch_never_deletes(self):
+        self.watch()
+        os.remove(os.path.join(self.dir, 'views', 'orders.view.lkml'))
+        time.sleep(1.5)
+        self.assertEqual([e for e in self.writes() if e[0] == 'DELETE'], [])
+        self.assertIn('views/orders.view.lkml', self.fake.dev_files())
+
+
+class WatchNetConflictTest(WatchNetTestCase):
+    """A file changed in Looker since the last sync is held, never overwritten."""
+
+    def test_file_changed_in_looker_is_held_not_written(self):
+        self.watch()
+        rel = 'views/orders.view.lkml'
+        self.fake.uncommitted[rel] = 'view: orders { # edited in the IDE\n}\n'
+        self.put_local(rel, 'view: orders { # edited here\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('held')), self.lines)
+        self.assertTrue(any('changed in Looker' in ln for ln in self.kinds('held')), self.lines)
+        self.assertTrue(self.has('held', rel), self.lines)
+        self.assertEqual(self.content_writes(), [])
+        self.assertEqual(self.fake.dev_files()[rel], 'view: orders { # edited in the IDE\n}\n')
+
+    def test_force_overwrites_looker_change(self):
+        self.watch(force=True)
+        rel = 'views/orders.view.lkml'
+        self.fake.uncommitted[rel] = 'view: orders { # edited in the IDE\n}\n'
+        self.put_local(rel, 'view: orders { # edited here\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('verified', rel)), self.lines)
+        self.assertEqual(self.fake.dev_files()[rel], 'view: orders { # edited here\n}\n')
+
+    def test_syntax_error_hold_points_at_one_shot_push(self):
+        self.watch()
+        rel = 'views/orders.view.lkml'
+        self.put_local(rel, 'view: orders {\n  dimension: id {\n')
+        self.assertTrue(self.wait_for(lambda: self.has('held', rel)), self.lines)
+        path_line = next(ln for ln in self.kinds('held') if rel in ln)
+        self.assertIn(self.cli.GATE_HINT, path_line)
+        self.assertIn('looker-sync push', path_line)
+        self.assertEqual(self.content_writes(), [])
+
+
+class WatchNetBranchTest(WatchNetTestCase):
+    """A branch switch in Looker pauses the watcher; switching back resumes it."""
+
+    def test_branch_switch_pauses_then_resumes(self):
+        w = self.watch(start=False)
+        w.BRANCH_EVERY = 0.2
+        w.start()
+        time.sleep(0.3)
+        self.fake.dev_branch = 'master'
+        self.assertTrue(self.wait_for(lambda: self.has('paused', "on branch 'master'")), self.lines)
+        rel = 'views/orders.view.lkml'
+        self.put_local(rel, 'view: orders { # while paused\n}\n')
+        time.sleep(1.0)
+        self.assertEqual(self.content_writes(), [])           # nothing written while paused
+        self.fake.dev_branch = 'feat'
+        self.assertTrue(self.wait_for(lambda: self.has('resumed')), self.lines)
+        self.assertTrue(self.wait_for(lambda: self.has('verified', rel)), self.lines)
+        self.assertEqual(self.fake.dev_files()[rel], 'view: orders { # while paused\n}\n')
+
+    def test_token_swap_onto_other_branch_keeps_old_token(self):
+        w = self.watch()
+        self.fake.dev_branch = 'master'
+        with self.assertRaises(self.cli.LookerError):
+            w._before_swap(w.L.token)
+        self.assertTrue(self.has('paused', 'token refresh'), self.lines)
+
+
+class WatchNetAuthTest(WatchNetTestCase):
+    """A 401 that survives the one retry pauses with a message; a good login resumes."""
+
+    def test_401_after_retry_pauses_then_resumes(self):
+        w = self.watch(start=False)
+        w.BRANCH_EVERY = 0.2
+        w.start()
+        time.sleep(0.3)
+        self.fake.force_401 = 10_000
+        self.put_local('views/orders.view.lkml', 'view: orders { # auth\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('paused', 'refused the session')), self.lines)
+        self.assertEqual(self.content_writes(), [])
+        self.fake.force_401 = 0
+        self.assertTrue(self.wait_for(lambda: self.has('resumed')), self.lines)
+        self.assertTrue(self.wait_for(lambda: self.has('verified', 'views/orders.view.lkml')), self.lines)
+
+
+class WatchNetValidateTest(WatchNetTestCase):
+    """--validate runs Looker validation once after a quiet period; off by default."""
+
+    def validations(self):
+        return [e for e in self.fake.log if e[1].endswith('/validate')]
+
+    def test_validate_runs_once_after_quiet(self):
+        w = self.watch(start=False, validate=True)
+        w.QUIET = 0.3
+        w.start()
+        time.sleep(0.3)
+        self.put_local('views/orders.view.lkml', 'view: orders { # a\n}\n')
+        self.put_local('models/demo.model.lkml', 'connection: "db2"\n')
+        self.assertTrue(self.wait_for(lambda: w.validations == 1), self.lines)
+        time.sleep(1.0)
+        self.assertEqual(w.validations, 1)
+        self.assertEqual(len(self.validations()), 1)
+
+    def test_no_validation_by_default(self):
+        self.watch()
+        self.put_local('views/orders.view.lkml', 'view: orders { # a\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('verified', 'views/orders.view.lkml')))
+        time.sleep(2.5)
+        self.assertEqual(self.validations(), [])
+
+
+class WatchNetLifecycleTest(WatchNetTestCase):
+    """Prod mode refuses; close() leaves no thread; Ctrl-C exits 0."""
+
+    def test_close_leaves_no_thread(self):
+        w = self.watch()
+        self.put_local('views/orders.view.lkml', 'view: orders { # a\n}\n')
+        self.assertTrue(self.wait_for(lambda: self.has('verified', 'views/orders.view.lkml')))
+        w.close()
+        self.nets.remove(w)
+        left = [t.name for t in threading.enumerate()
+                if t.name.startswith(('watch-', 'looker-token-refresh'))]
+        self.assertEqual(left, [])
+
+    def test_ctrl_c_exits_zero(self):
+        import signal
+        p = subprocess.Popen([sys.executable, CLI, '-C', self.dir, 'watch'], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+        try:
+            first = ''
+            while 'watching' not in first:
+                ln = p.stdout.readline()
+                self.assertTrue(ln, first)
+                first += ln
+            time.sleep(0.5)
+            p.send_signal(signal.SIGINT)
+            rest, _ = p.communicate(timeout=20)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, first + rest)
+        self.assertIn('stopped', rest)
+        self.assertNotIn('Traceback', rest)
+        self.assertNotIn(SECRET, first + rest)
+
+
+class WatchNetProdTest(FakeLookerTestCase):
+    def test_watch_refused_in_prod_mode(self):
+        r = self.run_cli('init', '--project', PROJECT, '--mode', 'prod')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        r = self.run_cli('watch')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn('refused in prod mode', r.stdout + r.stderr)
+        self.assertEqual(self.writes(), [])
+
 
 if __name__ == '__main__':
     unittest.main()
