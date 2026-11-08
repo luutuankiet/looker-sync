@@ -54,6 +54,8 @@ class FakeLooker:
         self.validation_errors = []
         self.mangle_readback = set()  # Looker stores different bytes than were sent
         self.fail_writes = set()  # writes to these paths answer 500
+        self.fail_deletes = set()  # deletes of these paths answer 500
+        self.ignore_deletes = set()  # deletes of these paths answer 204 and keep the file
         self.fail_checkout = set()  # checking out these branches answers 500
         # git fields, shaped as on a live instance
         self.production_branch = 'master'
@@ -235,6 +237,10 @@ class FakeLooker:
                     p = q.get('file_path') if method == 'DELETE' else body['path']
                     if method != 'DELETE' and p in fake.fail_writes:
                         return self.reply(500, {'message': 'test fake: write failed'})
+                    if method == 'DELETE' and p in fake.fail_deletes:
+                        return self.reply(500, {'message': 'test fake: delete failed'})
+                    if method == 'DELETE' and p in fake.ignore_deletes:
+                        return self.reply(204, None)    # says it worked, keeps the file
                     if method == 'POST':
                         if p in files:
                             return self.reply(400, {'message': 'File already exists'})
@@ -3034,7 +3040,7 @@ class WatchNetPushTest(WatchNetTestCase):
         self.assertEqual(len(self.content_writes()), n)      # held, not overwritten
 
     def test_watch_never_deletes(self):
-        self.watch()
+        self.watch(delete=False)
         os.remove(os.path.join(self.dir, 'views', 'orders.view.lkml'))
         time.sleep(1.5)
         self.assertEqual([e for e in self.writes() if e[0] == 'DELETE'], [])
@@ -3231,6 +3237,518 @@ class GlobRegexCacheTest(unittest.TestCase):
         self.assertIs(cli.glob_regex('**/*.view.lkml'), cli.glob_regex('**/*.view.lkml'))
         self.assertTrue(cli.glob_regex('**/*.view.lkml').match('a/b.view.lkml'))
         self.assertFalse(cli.glob_regex('*.view.lkml').match('a/b.view.lkml'))
+
+
+class WatchDeleteNetCase(WatchNetTestCase):
+    ORDERS = 'views/orders.view.lkml'
+
+    def deletes(self):
+        return [e for e in self.fake.log if e[0] == 'DELETE']
+
+    def path(self, rel):
+        return os.path.join(self.dir, *rel.split('/'))
+
+    def git(self, *args):
+        subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args],
+                       cwd=self.dir, env=hermetic_git_env(self.tmp.name), check=True,
+                       capture_output=True)
+
+    def git_repo(self):
+        self.git('init', '-q')
+        os.makedirs(os.path.join(self.dir, '.git', 'info'), exist_ok=True)
+        with open(os.path.join(self.dir, '.git', 'info', 'exclude'), 'a') as f:
+            f.write('.env\n.looker-sync/\n')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'base')
+
+    def synced_extra(self):
+        rel = 'views/extra.view.lkml'
+        self.put_local(rel, 'view: extra {}\n')
+        r = self.run_cli('push')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        return rel
+
+
+class WatchDeleteTest(WatchDeleteNetCase):
+    """Default watch: a local delete, rename or copy reaches Looker."""
+
+    def test_delete_prints_deleted_once_and_leaves_every_record(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        self.assertNotIn(self.ORDERS, self.fake.dev_files())
+        self.assertIsNone(self.state_sha(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.ORDERS not in w.core.gone), self.lines)
+        self.assertNotIn(self.ORDERS, w.known)
+        self.assertNotIn(self.ORDERS, w.core.synced)
+        self.assertEqual(len(self.kinds('deleted')), 1, self.lines)
+        self.assertEqual(len(self.deletes()), 1)
+        r = self.run_cli('status')
+        self.assertNotIn(self.ORDERS, r.stdout)
+
+    def test_rename_writes_new_then_deletes_old(self):
+        self.watch()
+        new = 'views/renamed.view.lkml'
+        os.rename(self.path(self.ORDERS), self.path(new))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        files = self.fake.dev_files()
+        self.assertEqual(files[new], 'view: orders {}\n')
+        self.assertNotIn(self.ORDERS, files)
+        methods = [e[0] for e in self.fake.log if e[0] in ('POST', 'DELETE')
+                   and e[1].endswith('/files')]
+        self.assertEqual(methods, ['POST', 'DELETE'])
+        self.assertTrue(self.has('deleted', f'moved to {new}'), self.lines)
+
+    def test_rename_with_edit_writes_new_then_deletes_old(self):
+        self.watch()
+        new = 'views/renamed.view.lkml'
+        os.rename(self.path(self.ORDERS), self.path(new))
+        with open(self.path(new), 'a') as f:
+            f.write('# edited\n')
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        files = self.fake.dev_files()
+        self.assertEqual(files[new], 'view: orders {}\n# edited\n')
+        self.assertNotIn(self.ORDERS, files)
+
+    def test_copy_is_written_with_no_suspects_hold(self):
+        self.watch()
+        new = 'views/copy.view.lkml'
+        shutil.copy(self.path(self.ORDERS), self.path(new))
+        self.assertTrue(self.wait_for(lambda: self.has('verified', new)), self.lines)
+        self.assertEqual(self.kinds('held'), [])
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(self.ORDERS, self.fake.dev_files())
+
+
+class WatchNoDeleteTest(WatchDeleteNetCase):
+    """--no-delete keeps the v0.3.0 holds."""
+
+    def test_missing_file_is_held_not_deleted(self):
+        self.watch(delete=False)
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.has('held', 'watch never deletes')), self.lines)
+        self.assertEqual(self.deletes(), [])
+
+    def test_move_is_held_and_nothing_is_written(self):
+        self.watch(delete=False)
+        new = 'views/renamed.view.lkml'
+        os.rename(self.path(self.ORDERS), self.path(new))
+        self.assertTrue(self.wait_for(lambda: self.has('held', 'moved file')), self.lines)
+        self.assertTrue(self.has('held', f'{self.ORDERS} -> {new}') or
+                        any(f'{self.ORDERS} -> {new}' in ln for ln in self.lines), self.lines)
+        self.assertEqual(self.deletes(), [])
+        self.assertNotIn(new, self.fake.dev_files())
+
+    def test_copy_is_held_as_a_suspect(self):
+        self.watch(delete=False)
+        new = 'views/copy.view.lkml'
+        shutil.copy(self.path(self.ORDERS), self.path(new))
+        self.assertTrue(self.wait_for(lambda: self.has('held', 'look like a copy')), self.lines)
+        self.assertNotIn(new, self.fake.dev_files())
+
+    def test_no_delete_flag_reaches_watch_through_argparse(self):
+        import signal
+        p = subprocess.Popen([sys.executable, CLI, '-C', self.dir, 'watch', '--no-delete'],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, text=True)
+        try:
+            first = ''
+            while 'watching' not in first:
+                ln = p.stdout.readline()
+                self.assertTrue(ln, first)
+                first += ln
+            time.sleep(0.5)
+            os.remove(self.path(self.ORDERS))
+            time.sleep(2.5)
+            p.send_signal(signal.SIGINT)
+            rest, _ = p.communicate(timeout=20)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, first + rest)
+        self.assertIn('watch never deletes', rest)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(self.ORDERS, self.fake.dev_files())
+
+
+class WatchDeleteSafetyTest(WatchDeleteNetCase):
+    """The ways a delete could reach Looker when nobody meant one."""
+
+    def test_rule1_real_git_checkout_removing_files_sends_no_delete(self):
+        self.git_repo()
+        self.git('branch', 'old')
+        extra = self.synced_extra()
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'extra')
+        self.watch()
+        self.git('checkout', '-q', 'old')
+        self.assertFalse(os.path.exists(self.path(extra)))
+        self.assertTrue(self.wait_for(lambda: any('push --delete' in ln for ln in self.kinds('held'))
+                                      and self.has('held', extra)), self.lines)
+        time.sleep(2.0)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(extra, self.fake.dev_files())
+
+    def test_rule1_real_git_reset_hard_on_one_branch_sends_no_delete(self):
+        self.git_repo()
+        extra = self.synced_extra()
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'extra')
+        self.watch()
+        self.git('reset', '-q', '--hard', 'HEAD~1')
+        self.assertTrue(self.wait_for(lambda: any('push --delete' in ln for ln in self.kinds('held'))
+                                      and self.has('held', extra)), self.lines)
+        time.sleep(2.0)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(extra, self.fake.dev_files())
+
+    def test_rule2_unlink_then_recreate_under_grace_sends_no_delete(self):
+        w = self.watch()
+        self.assertGreaterEqual(w.core.DELETE_GRACE, 1.0)
+        os.remove(self.path(self.ORDERS))
+        time.sleep(0.5)
+        self.put_local(self.ORDERS, 'view: orders {}\n')
+        time.sleep(2.5)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(self.ORDERS, self.fake.dev_files())
+
+    def test_rule7_rename_whose_write_fails_leaves_the_old_path(self):
+        self.watch()
+        new = 'views/renamed.view.lkml'
+        self.fake.fail_writes.add(new)
+        os.rename(self.path(self.ORDERS), self.path(new))
+        self.assertTrue(self.wait_for(lambda: any(new in ln and 'error' in ln for ln in self.lines)),
+                        self.lines)
+        time.sleep(2.5)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(self.ORDERS, self.fake.dev_files())
+        self.fake.fail_writes.clear()
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS), 20), self.lines)
+        self.assertIn(new, self.fake.dev_files())
+        self.assertNotIn(self.ORDERS, self.fake.dev_files())
+
+    def test_delete_failure_retries_and_keeps_state(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        self.fake.fail_deletes.add(self.ORDERS)
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: any(self.ORDERS in ln and 'error' in ln
+                                                  for ln in self.lines)), self.lines)
+        self.assertFalse(self.has('deleted', self.ORDERS), self.lines)
+        self.assertIsNotNone(self.state_sha(self.ORDERS))
+        self.fake.fail_deletes.clear()
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS), 20), self.lines)
+        self.assertNotIn(self.ORDERS, self.fake.dev_files())
+
+
+class WatchDeleteRulesNetTest(WatchDeleteNetCase):
+    """Rules 3, 4, 5, 6 (prod) and 8 against the fake Looker."""
+
+    def test_rule4_file_only_in_looker_is_untouched(self):
+        only = 'views/only.view.lkml'
+        self.fake.dev_write(only, 'view: only {}\n')
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        self.assertIn(only, self.fake.dev_files())
+        self.assertEqual(len(self.deletes()), 1)
+
+    def test_rule5_changed_in_looker_is_held_then_force_deletes(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        self.fake.uncommitted[self.ORDERS] = 'view: orders { # edited in the IDE\n}\n'
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: any('changed in Looker' in ln for ln in self.kinds('held'))),
+                        self.lines)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(self.ORDERS, self.fake.dev_files())
+
+    def test_rule5_force_deletes_a_file_changed_in_looker(self):
+        w = self.watch(force=True)
+        w.core.DELETE_GRACE = 0.2
+        self.fake.uncommitted[self.ORDERS] = 'view: orders { # edited in the IDE\n}\n'
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        self.assertEqual(len(self.deletes()), 1)
+
+    def test_rule5_already_gone_in_looker_drops_state_and_reports(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        self.fake.dev_write(self.ORDERS, None)
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        self.assertTrue(self.has('deleted', 'already gone'), self.lines)
+        self.assertIsNone(self.state_sha(self.ORDERS))
+        self.assertEqual(self.deletes(), [])
+
+    def test_rule6_prod_mode_refuses_in_delete_one(self):
+        w = self.watch(start=False)
+        w.sess.mode = 'production'
+        with self.assertRaises(self.cli.Refused):
+            w.delete_one(self.ORDERS)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(self.ORDERS, self.fake.dev_files())
+
+    def test_rule8_readback_still_present_prints_no_deleted(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        self.fake.ignore_deletes.add(self.ORDERS)
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: any('still has the file' in ln for ln in self.lines)),
+                        self.lines)
+        self.assertFalse(self.has('deleted', self.ORDERS), self.lines)
+        self.assertIsNotNone(self.state_sha(self.ORDERS))
+        self.assertIn(self.ORDERS, w.core.synced)
+
+    def test_rule8_queued_readback_cannot_restore_a_deleted_path(self):
+        w = self.watch(start=False)
+        w._drop(self.ORDERS)
+        self.assertFalse(w._record_unless_dropped(self.ORDERS, 'abc'))
+        self.assertIsNone(self.state_sha(self.ORDERS))
+        self.assertNotIn(self.ORDERS, w.known)
+
+    def test_rule9_no_ref_in_any_branch_body_during_a_delete_run(self):
+        w = self.watch()
+        w.core.DELETE_GRACE = 0.2
+        os.remove(self.path(self.ORDERS))
+        self.assertTrue(self.wait_for(lambda: self.has('deleted', self.ORDERS)), self.lines)
+        bodies = [e[3] for e in self.fake.log if e[1].endswith('git_branch') and e[3]]
+        self.assertFalse([b for b in bodies if 'ref' in b], bodies)
+
+
+class WatchDeleteCoreTest(WatchCoreTestCase):
+    """Rules 3, 5 and 6 on the core, with a fake clock and a fake delete_one."""
+    A, B = 'views/a.view.lkml', 'views/b.view.lkml'
+
+    def setUp(self):
+        super().setUp()
+        self.dels, self.del_answer = [], None
+
+    def delete_one(self, rel, new_path, new_sha):
+        self.dels.append((rel, new_path))
+        return self.del_answer
+
+    def start(self, **kw):
+        self.a_full = self.put(self.A, 'view: a {}\n', synced=True)
+        self.core(delete_one=self.delete_one, **kw)
+        self.at(0)
+
+    def run_to(self, a, b, step=0.25):
+        t = a
+        while t <= b:
+            self.at(t)
+            t += step
+
+    def test_rule3_missing_at_start_is_not_deleted(self):
+        full = self.put(self.A, 'view: a {}\n', synced=True)
+        os.remove(full)
+        self.core(delete_one=self.delete_one)
+        self.run_to(0, 6)
+        self.assertEqual(self.dels, [])
+        self.assertTrue(self.held('already missing'), self.events)
+
+    def test_rule5_held_delete_is_tried_once_until_the_file_returns(self):
+        self.start()
+        self.del_answer = 'changed in Looker'
+        os.remove(self.a_full)
+        self.run_to(1, 10)
+        self.assertEqual(len(self.dels), 1, self.events)
+        self.assertFalse(self.kinds('deleted'))
+        self.put(self.A, 'view: a {}\n')
+        self.run_to(10.25, 12)
+        os.remove(self.a_full)
+        self.run_to(12.25, 20)
+        self.assertEqual(len(self.dels), 2, self.events)
+
+    def test_rule2_lstat_finding_the_file_after_the_plan_keeps_it(self):
+        self.start()
+        os.remove(self.a_full)
+        self.run_to(1, 2)
+        real = self.c.proj.scan
+
+        def scan(previous=None):
+            s = real(previous=previous)
+            self.put(self.A, 'view: a {}\n')
+            return s
+        self.c.proj.scan = scan
+        self.at(3)
+        self.c.proj.scan = real
+        self.assertEqual(self.dels, [])
+
+    def assert_held_delete(self):
+        self.assertEqual(self.dels, [], self.events)
+        self.assertEqual(self.pushes, [], self.events)
+
+    def test_rule6_external_pause_holds_a_delete_only_tick(self):
+        self.start()
+        self.c.external_pause = True
+        os.remove(self.a_full)
+        self.run_to(1, 6)
+        self.assert_held_delete()
+
+    def test_rule6_hold_check_holds_a_delete_only_tick(self):
+        self.start()
+        self.c.hold_check = lambda: 'wrong branch'
+        os.remove(self.a_full)
+        self.run_to(1, 6)
+        self.assert_held_delete()
+        self.assertTrue(self.held('wrong branch'), self.events)
+
+    def test_rule6_root_gone_holds_a_delete(self):
+        self.start()
+        shutil.move(self.root, self.root + '.away')
+        self.run_to(1, 6)
+        self.assert_held_delete()
+
+    def test_rule6_unreadable_folder_holds_a_delete_elsewhere(self):
+        self.start()
+        locked = os.path.join(self.root, 'locked')
+        os.makedirs(locked)
+        os.remove(self.a_full)
+        self.at(1)
+        os.chmod(locked, 0)
+        self.run_to(1.25, 6)
+        self.assert_held_delete()
+        self.assertTrue(self.held('cannot be read'), self.events)
+
+    def test_rule6_git_busy_holds_a_delete(self):
+        self.start()
+        with mock.patch.object(self.c, '_git_busy', return_value='git is busy'):
+            os.remove(self.a_full)
+            self.run_to(1, 6)
+        self.assert_held_delete()
+
+    def test_rule6_ceiling_counts_writes_plus_deletes(self):
+        b = self.put(self.B, 'view: b {}\n', synced=True)
+        self.start(ceiling=2)
+        os.remove(self.a_full)
+        os.remove(b)
+        self.put('views/c.view.lkml', 'view: c {}\n')
+        self.at(1)
+        self.run_to(1.25, 6)
+        self.assert_held_delete()
+        self.assertTrue(self.held('more than 2'), self.events)
+
+    def test_rule6_syntax_gate_failure_holds_a_due_delete(self):
+        self.start(gate=lambda rel, data: 'bad' if b'broken' in data else None)
+        os.remove(self.a_full)
+        self.put('views/c.view.lkml', 'view: c { broken\n')
+        self.run_to(1, 6)
+        self.assert_held_delete()
+        self.assertTrue(self.held('syntax error'), self.events)
+
+
+class WatchDeleteBugTest(WatchDeleteCoreTest):
+    """Each of these was found by review; the test came first."""
+
+    def test_overwrite_rename_keeps_old_path_while_new_is_held(self):
+        b = self.put(self.B, 'view: b {}\n', synced=True)
+        self.start()
+        os.replace(self.a_full, b)      # b now holds a's bytes: it changed, and a is gone
+        self.answer = 'changed in Looker'
+        self.run_to(1, 8)
+        self.assertEqual(self.dels, [], self.events)
+        self.assertTrue(self.held('new path is held'), self.events)
+
+    def test_overwrite_rename_deletes_old_path_after_new_is_written(self):
+        b = self.put(self.B, 'view: b {}\n', synced=True)
+        self.start()
+        os.replace(self.a_full, b)
+        self.run_to(1, 8)
+        self.assertEqual([p[0] for p in self.pushes], [self.B], self.events)
+        self.assertEqual(self.dels, [(self.A, self.B)], self.events)
+
+    def test_old_path_waits_for_a_renamed_file_still_being_written(self):
+        self.start()
+        new = os.path.join(self.root, *self.B.split('/'))
+        os.rename(self.a_full, new)         # same inode: this is a rename, not a new file
+        t, n = 1.0, 0
+        while t <= 9:
+            n += 1
+            if t < 5:
+                with open(new, 'a') as f:   # churning past the grace period and past MAX_WAIT
+                    f.write(f'# {n}\n')
+            self.at(t)
+            if self.dels:
+                self.assertTrue(self.pushes, f'old path deleted before the new one at {t}')
+            t += 0.25
+        self.assertEqual(self.dels, [(self.A, self.B)], self.events)
+
+    def test_ref_moved_just_before_the_files_vanish_sends_no_delete(self):
+        self.start()
+        with mock.patch.object(self.c, '_git_refs_moved', return_value=True):
+            self.at(1)
+        os.remove(self.a_full)                  # next scan: refs quiet, no lock, file gone
+        self.run_to(1.25, 6)
+        self.assertEqual(self.dels, [], self.events)
+        self.assertTrue(self.held('vanished during a git operation'), self.events)
+
+    def test_case_only_rename_deletes_the_old_spelling_simulated(self):
+        """Simulated: lstat is patched. Linux has no case-insensitive volume to run this on."""
+        low, up = 'b0.view.lkml', 'B0.view.lkml'
+        old = self.put(low, 'view: b0 {}\n', synced=True)
+        self.core(delete_one=self.delete_one)
+        self.at(0)
+        new = os.path.join(self.root, up)
+        os.replace(old, new)
+        real = os.lstat
+
+        def lstat(path, *a, **kw):
+            return real(new if os.fspath(path) == old else path, *a, **kw)
+        with mock.patch('os.lstat', lstat):
+            self.run_to(1, 8)
+        self.assertEqual([p[0] for p in self.pushes], [up], self.events)
+        self.assertEqual(self.dels, [(low, up)], self.events)
+
+
+class WatchDeleteGitStashTest(WatchDeleteNetCase):
+
+    def test_real_git_stash_u_removing_a_synced_file_sends_no_delete(self):
+        self.git_repo()
+        extra = self.synced_extra()         # synced but untracked: only -u removes it
+        self.watch()
+        self.git('stash', '-u', '-q')
+        self.assertFalse(os.path.exists(self.path(extra)))
+        self.assertTrue(self.wait_for(lambda: self.has('held', extra)), self.lines)
+        time.sleep(2.0)
+        self.assertEqual(self.deletes(), [])
+        self.assertIn(extra, self.fake.dev_files())
+
+
+class WatchDeleteSettlingOverwriteTest(WatchDeleteCoreTest):
+
+    def test_old_path_stays_while_an_overwritten_synced_target_never_settles(self):
+        b = self.put(self.B, 'view: b {}\n', synced=True)
+        self.start()
+        os.replace(self.a_full, b)
+        t, n = 1.0, 0
+        while t <= 9:
+            n += 1
+            with open(b, 'a') as f:
+                f.write(f'# {n}\n')
+            self.at(t)
+            t += 0.25
+        self.assertEqual(self.dels, [], self.events)
+
+
+class WatchDeleteStuckTargetTest(WatchDeleteCoreTest):
+
+    def test_old_path_stays_while_the_new_path_can_never_be_read_stably(self):
+        self.start()
+        new = os.path.join(self.root, *self.B.split('/'))
+        os.rename(self.a_full, new)
+        real = self.c.proj.read_entry
+
+        def read_entry(rel):
+            r = real(rel)
+            return self.cli.ReadResult('unstable', None, r.entry) if rel == self.B else r
+        self.c.proj.read_entry = read_entry
+        self.run_to(1, 9)
+        self.assertEqual(self.dels, [], self.events)
+        self.assertEqual(self.pushes, [], self.events)
+        self.assertTrue(self.held('still being written'), self.events)
 
 
 if __name__ == '__main__':
