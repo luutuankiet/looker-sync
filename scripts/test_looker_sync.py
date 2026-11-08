@@ -14,10 +14,12 @@ import json
 import os
 import pty
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 import urllib.request
@@ -63,6 +65,13 @@ class FakeLooker:
         self.stale_checkout = set()
         self.personal = {'feat'}     # live: the user's own dev branch is personal
         self.readonly = {'master'}   # live: the production branch is readonly in dev mode
+        # connection layer: HTTP/1.1 keep-alive, as measured live (idle connections survived 30,
+        # 120 and 300 s); login answers expires_in like live (3599 s)
+        self.expires_in = 3599
+        self.logins = 0              # successful logins so far
+        self.connections = 0         # TCP connections accepted
+        self.sockets = []            # every accepted socket, for drop_connections
+        self.force_401 = 0           # answer this many authenticated requests (not /session) with 401
 
     def set_git_remote(self, shape, url=None):
         """Serve one of GIT_REMOTE_SHAPES on GET /projects/{p}; url overrides the remote URL."""
@@ -122,10 +131,30 @@ class FakeLooker:
         else:
             self.uncommitted[path] = content
 
+    def drop_connections(self):
+        """Close every open connection from the server side, as an idle timeout would."""
+        for s in self.sockets:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def serve(self):
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Live Looker keeps connections alive; HTTP/1.1 makes the fake do the same. Every
+            # reply carries Content-Length, so the client can reuse the connection.
+            protocol_version = 'HTTP/1.1'
+
+            def setup(self):
+                super().setup()
+                # headers and body go out in two writes; without this, Nagle plus the client's
+                # delayed ACK stalls every reply on a kept-alive connection by about 40 ms
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                fake.connections += 1
+                fake.sockets.append(self.connection)
+
             def log_message(self, *a):
                 pass
 
@@ -146,11 +175,16 @@ class FakeLooker:
                     form = dict(urllib.parse.parse_qsl(raw_body))
                     if form.get('client_secret') != SECRET:
                         return self.reply(404, {'message': 'Not found'})
-                    tok = f'tok{len(fake.tokens)}'
+                    tok = f'tok{fake.logins}'   # unique even after a test revokes a token
+                    fake.logins += 1
                     fake.tokens[tok] = 'production'
-                    return self.reply(200, {'access_token': tok})
+                    return self.reply(200, {'access_token': tok, 'token_type': 'Bearer',
+                                            'expires_in': fake.expires_in})
                 tok = (self.headers.get('Authorization') or '').replace('token ', '')
                 if tok not in fake.tokens:
+                    return self.reply(401, {'message': 'Requires authentication.'})
+                if fake.force_401 and path != '/session':
+                    fake.force_401 -= 1
                     return self.reply(401, {'message': 'Requires authentication.'})
                 ws = fake.tokens[tok]
                 body = json.loads(raw_body) if raw_body else None
@@ -1466,6 +1500,1045 @@ class GitDriftTest(GitTestCase):
         self.assertIn('read-only', r.stdout)
         self.assertEqual(self.git_calls(), [])
 
+
+def _import_cli():
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from looker_sync import cli
+    return cli
+
+
+def _in_thread(fn, timeout=10):
+    """Run fn in a daemon thread; return (finished, result or exception). A hang fails the test
+    instead of hanging the suite."""
+    box = {}
+
+    def run():
+        try:
+            box['value'] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box['value'] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return not t.is_alive(), box.get('value')
+
+
+def _unblock_fifo(path):
+    """If something is stuck opening the FIFO for reading, a writer releases it."""
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+    except OSError:
+        pass
+
+
+class LocalScanTest(unittest.TestCase):
+    """scan_tree / read_stable / Project.local_files on awkward folders, no Looker involved."""
+
+    def setUp(self):
+        self.cli = _import_cli()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.proj = self.cli.Project(self.root)
+        self.put('views/real.view.lkml', 'view: real {}\n')
+
+    def tearDown(self):
+        for dirpath, dirnames, _ in os.walk(self.root):
+            for d in dirnames:
+                try:
+                    os.chmod(os.path.join(dirpath, d), 0o755)
+                except OSError:
+                    pass
+        self.tmp.cleanup()
+
+    def put(self, rel, text):
+        full = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'w') as f:
+            f.write(text)
+        return full
+
+    def test_fifo_named_like_a_view_does_not_hang(self):
+        fifo = os.path.join(self.root, 'views', 'x.view.lkml')
+        os.mkfifo(fifo)
+        self.addCleanup(_unblock_fifo, fifo)
+        done, scan = _in_thread(self.proj.scan)
+        self.assertTrue(done, 'scan hung on a FIFO')
+        self.assertEqual(sorted(scan.entries), ['views/real.view.lkml'])
+        done, r = _in_thread(lambda: self.cli.read_stable(fifo))
+        self.assertTrue(done, 'read hung on a FIFO')
+        self.assertEqual(r.status, 'not_regular')
+        done, files = _in_thread(self.proj.local_files)
+        self.assertTrue(done, 'local_files hung on a FIFO')
+        self.assertEqual(files, {'views/real.view.lkml': b'view: real {}\n'})
+
+    def test_dangling_symlink_is_skipped(self):
+        os.symlink(os.path.join(self.root, 'nowhere.lkml'), os.path.join(self.root, 'y.view.lkml'))
+        self.assertEqual(sorted(self.proj.scan().entries), ['views/real.view.lkml'])
+        self.assertEqual(list(self.proj.local_files()), ['views/real.view.lkml'])
+        self.assertEqual(self.proj.read_entry('y.view.lkml').status, 'vanished')
+
+    def test_symlink_to_a_file_still_counts_as_that_file(self):
+        os.symlink(os.path.join(self.root, 'views', 'real.view.lkml'),
+                   os.path.join(self.root, 'link.view.lkml'))
+        self.assertEqual(self.proj.local_files()['link.view.lkml'], b'view: real {}\n')
+
+    def test_symlink_loops_are_skipped(self):
+        a, b = os.path.join(self.root, 'a.view.lkml'), os.path.join(self.root, 'b.view.lkml')
+        os.symlink(b, a)
+        os.symlink(a, b)
+        os.symlink(self.root, os.path.join(self.root, 'views', 'loopdir'))  # folder loop
+        done, scan = _in_thread(self.proj.scan)
+        self.assertTrue(done)
+        self.assertEqual(sorted(scan.entries), ['views/real.view.lkml'])
+        self.assertEqual(self.cli.read_stable(a).status, 'not_regular')
+        self.assertEqual(list(self.proj.local_files()), ['views/real.view.lkml'])
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can list any folder')
+    def test_unreadable_folder_is_reported_not_treated_as_empty(self):
+        self.put('locked/inner.view.lkml', 'view: inner {}\n')
+        first = self.proj.scan()
+        self.assertIn('locked/inner.view.lkml', first.entries)
+        os.chmod(os.path.join(self.root, 'locked'), 0)
+        second = self.proj.scan()
+        self.assertEqual(second.unreadable, ['locked'])
+        self.assertNotIn('locked/inner.view.lkml', second.entries)
+        carried = self.proj.scan(previous=first)
+        self.assertEqual(carried.carried, ['locked/inner.view.lkml'])
+        self.assertEqual(carried.entries['locked/inner.view.lkml'],
+                         first.entries['locked/inner.view.lkml'])
+        with self.assertRaises(self.cli.Refused):
+            self.proj.local_files()
+
+    def test_file_vanishing_between_scan_and_read(self):
+        scan = self.proj.scan()
+        os.unlink(os.path.join(self.root, 'views', 'real.view.lkml'))
+        self.assertEqual(self.proj.read_entry('views/real.view.lkml').status, 'vanished')
+        self.assertIn('views/real.view.lkml', scan.entries)
+        real_scan = self.proj.scan
+        with mock.patch.object(self.proj, 'scan', lambda previous=None: scan):
+            self.assertEqual(self.proj.local_files(), {})
+        self.assertEqual(real_scan().entries, {})
+
+    def test_file_changing_during_read_is_unstable(self):
+        full = os.path.join(self.root, 'views', 'real.view.lkml')
+        real_read = os.read
+        state = {'n': 0}
+
+        def growing_read(fd, n):
+            state['n'] += 1
+            if state['n'] == 1:
+                with open(full, 'a') as f:
+                    f.write('# appended mid-read\n' * 50)
+            return real_read(fd, n)
+        with mock.patch.object(self.cli.os, 'read', growing_read):
+            r = self.cli.read_stable(full, 'views/real.view.lkml')
+        self.assertEqual(r.status, 'unstable')
+        self.assertIsNone(r.data)
+        r = self.cli.read_stable(full, 'views/real.view.lkml')
+        self.assertEqual(r.status, 'ok')
+        self.assertEqual(r.entry.size, len(r.data))
+
+    def test_file_replaced_during_read_is_unstable(self):
+        full = os.path.join(self.root, 'views', 'real.view.lkml')
+        real_read = os.read
+        state = {'n': 0}
+
+        def replacing_read(fd, n):
+            state['n'] += 1
+            if state['n'] == 1:
+                tmp = self.put('views/.tmp-save', 'view: new {}\n')
+                os.replace(tmp, full)
+            return real_read(fd, n)
+        with mock.patch.object(self.cli.os, 'read', replacing_read):
+            self.assertEqual(self.cli.read_stable(full).status, 'unstable')
+
+    def test_local_files_refuses_a_file_that_never_settles(self):
+        unstable = self.cli.ReadResult('unstable', None, None)
+        with mock.patch.object(self.proj, 'read_entry', lambda rel: unstable), \
+                mock.patch.object(self.cli.time, 'sleep', lambda s: None):
+            with self.assertRaises(self.cli.Refused):
+                self.proj.local_files()
+
+    def test_editor_temp_names_are_ignored(self):
+        for name in ('.#x.lkml', '._x.lkml', '~x.lkml', '#x.lkml#', '4913', 'x.lkml~',
+                     'x.lkml.swp', '.x.lkml.swp', '.hidden/y.view.lkml', '.git/z.lkml'):
+            self.put(f'views/{name}', 'junk')
+        self.put('views/x.lkml', 'view: x {}\n')
+        self.assertEqual(sorted(self.proj.scan().entries), ['views/real.view.lkml', 'views/x.lkml'])
+        self.assertEqual(sorted(self.proj.local_files()), ['views/real.view.lkml', 'views/x.lkml'])
+        # Looker's side uses the same rule, so an ignored name is never taken as deleted locally
+        self.assertFalse(self.proj.synced('views/.#x.lkml'))
+        self.assertFalse(self.proj.synced('.hidden/y.view.lkml'))
+        self.assertTrue(self.proj.synced('views/x.lkml'))
+
+    def test_scan_entry_shape(self):
+        full = os.path.join(self.root, 'views', 'real.view.lkml')
+        st = os.stat(full)
+        scan = self.proj.scan()
+        self.assertEqual(scan.entries['views/real.view.lkml'],
+                         self.cli.ScanEntry('views/real.view.lkml', st.st_mtime_ns, st.st_size,
+                                            st.st_ino, st.st_dev))
+        self.assertEqual((scan.unreadable, scan.carried), ([], []))
+        self.assertLessEqual(scan.started_ns, self.cli.time.time_ns())
+
+
+class LocalScanCLITest(FakeLookerTestCase):
+    def test_status_and_dry_run_push_complete_with_a_fifo_in_the_folder(self):
+        self.init()
+        fifo = os.path.join(self.dir, 'views', 'x.view.lkml')
+        os.mkfifo(fifo)
+        self.addCleanup(_unblock_fifo, fifo)
+        os.symlink(os.path.join(self.dir, 'gone.lkml'), os.path.join(self.dir, 'y.view.lkml'))
+        for args in (['status'], ['push', '--dry-run']):
+            try:
+                r = subprocess.run([sys.executable, CLI, '-C', self.dir, *args], capture_output=True,
+                                   text=True, stdin=subprocess.DEVNULL, timeout=20)
+            except subprocess.TimeoutExpired:
+                _unblock_fifo(fifo)
+                self.fail(f'{args} hung on a FIFO')
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn('x.view.lkml', r.stdout)
+            self.assertNotIn('Traceback', r.stderr)
+
+
+GATE_VIEW = '''# Orders view. Braces in a comment: { { } and a "quote
+view: orders {
+  sql_table_name: analytics.orders ;;
+  drill_fields: [id, status]
+
+  dimension: id {
+    primary_key: yes
+    type: number
+    sql: ${TABLE}.id ;;
+  }
+
+  dimension: status {
+    label: "Status {raw}"
+    description: "Says \\"done\\" when the order shipped"
+    type: string
+    sql: CASE WHEN ${TABLE}.s = '}' THEN '{' ELSE ${TABLE}.s END ;;
+    html: <span style="color: {{ value }}">{{ rendered_value }}</span> ;;
+  }
+
+  dimension: is_big {
+    type: yesno
+    sql: ${TABLE}.amount > 100
+      AND ${TABLE}.status <> '}' ;;
+  }
+
+  measure: total {
+    type: sum
+    sql: ${TABLE}.amount ;;
+    value_format_name: usd
+    link: {
+      label: "Detail"
+      url: "/dashboards/1?f={{ value }}"
+    }
+  }
+
+  measure: big_total {
+    type: number
+    sql: ${total} ;;
+    filters: [is_big: "yes"]
+  }
+}
+'''
+
+GATE_EXPLORE = '''include: "/views/*.view.lkml"
+
+explore: orders {
+  label: "Orders"
+  sql_always_where: ${orders.status} <> 'test {x}' ;;
+  join: customers {
+    type: left_outer
+    relationship: many_to_one
+    sql_on: ${orders.customer_id} = ${customers.id} ;;
+  }
+  always_filter: {
+    filters: [orders.status: "done"]
+  }
+}
+'''
+
+GATE_MODEL = '''connection: "warehouse"
+
+include: "/views/*.view.lkml"
+include: "/explores/*.explore.lkml"
+
+datagroup: nightly {
+  sql_trigger: SELECT CURRENT_DATE() ;;
+  max_cache_age: "24 hours"
+}
+
+persist_with: nightly
+
+explore: customers {
+  # a comment with a lone } brace
+  fields: [ALL_FIELDS*]
+}
+'''
+
+GATE_DASHBOARD = '''- dashboard: sales
+  title: Sales { not lkml
+  layout: newspaper
+  elements:
+  - name: total
+    type: single_value
+'''
+
+GATE_CORPUS = {
+    'views/orders.view.lkml': GATE_VIEW,
+    'explores/orders.explore.lkml': GATE_EXPLORE,
+    'demo.model.lkml': GATE_MODEL,
+}
+
+GATE_VALUE_KEYS = ('sql:', 'html:', 'sql_on:', 'sql_always_where:', 'sql_trigger:',
+                   'sql_table_name:')
+
+
+def _gate_inside_value(text, i):
+    """True when position i of a corpus file is inside a string, a comment or a `;;` block,
+    where removing a brace leaves the file valid."""
+    line = text[text.rfind('\n', 0, i) + 1:i]
+    if '#' in line or line.count('"') % 2 == 1:
+        return True
+    head = text[:i]
+    last_close = head.rfind(';;')
+    return any(head.rfind(key) > last_close for key in GATE_VALUE_KEYS)
+
+
+def gate_mutations(text):
+    """Yield (name, broken_text) for one valid corpus file. Every yielded text is broken
+    LookML that the gate must hold."""
+    lines = text.split('\n')
+    for i, ch in enumerate(text):
+        if ch in '{}' and not _gate_inside_value(text, i):
+            yield f'drop {ch} at offset {i}', text[:i] + text[i + 1:]
+    ends = [len('\n'.join(lines[:n + 1])) for n in range(len(lines))]
+    for n in range(len(lines)):
+        if _gate_inside_value(text, ends[n]):
+            continue  # inside a multi-line sql or html block, where anything goes
+
+        def insert(extra):
+            return '\n'.join(lines[:n + 1] + [extra] + lines[n + 1:])
+        yield f'extra }} after line {n + 1}', insert('}')
+        yield f'garbage after line {n + 1}', insert('@@ oops')
+        yield f'colonless key after line {n + 1}', insert('hidden yes')
+    start = 0
+    while text.find(';;', start) >= 0:
+        j = text.find(';;', start)
+        yield f'drop ;; at offset {j}', text[:j] + text[j + 2:]
+        start = j + 2
+    for m, line in enumerate(lines):
+        if (line.count('"') == 2 and '\\' not in line and not line.lstrip().startswith('#')
+                and not any(key in line for key in GATE_VALUE_KEYS)):
+            k = line.rindex('"')
+            yield f'unterminated string line {m + 1}', '\n'.join(
+                lines[:m] + [line[:k] + line[k + 1:]] + lines[m + 1:])
+
+
+class GateTest(unittest.TestCase):
+    """The syntax gate: valid LookML passes, broken copies are held with a one-line reason."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from looker_sync import gate
+        cls.gate = gate
+
+    def check(self, path, text):
+        return self.gate.check(path, text.encode('utf-8') if isinstance(text, str) else text)
+
+    def test_valid_view_explore_model_pass(self):
+        for path, text in GATE_CORPUS.items():
+            with self.subTest(path=path):
+                self.assertIsNone(self.check(path, text))
+        self.assertIsNone(self.check('views/empty.view.lkml', ''))
+
+    def test_dashboard_and_non_lkml_files_pass_unchecked(self):
+        self.assertIsNone(self.check('dashboards/sales.dashboard.lookml', GATE_DASHBOARD))
+        self.assertIsNone(self.check('docs/readme.md', '{{{ not lookml'))
+        self.assertIsNone(self.check('manifest.json', b'\xff\xfe'))
+
+    def test_non_utf8_fails(self):
+        reason = self.check('views/orders.view.lkml', b'view: a {\n  label: "\xff"\n}\n')
+        self.assertIn('UTF-8', reason)
+
+    def test_named_breakages_fail_with_one_line_reason(self):
+        cases = {
+            'missing brace': (GATE_VIEW.replace('  dimension: id {', '  dimension: id', 1),
+                              None),
+            'extra closing brace': (GATE_VIEW.replace('    primary_key: yes\n',
+                                                      '    primary_key: yes\n  }\n', 1),
+                                    'extra closing brace on line 42'),
+            'extra brace at end': (GATE_VIEW + '}\n', 'extra closing brace'),
+            'unterminated string': (GATE_VIEW.replace('label: "Status {raw}"',
+                                                      'label: "Status {raw}', 1), None),
+            'missing ;;': (GATE_VIEW.replace('${TABLE}.amount ;;', '${TABLE}.amount', 1),
+                           'sql: on line 28 is missing its ;; (it runs on into '
+                           'value_format_name: on line 29)'),
+            'last ;; missing': (GATE_VIEW.replace('sql: ${total} ;;', 'sql: ${total}', 1),
+                                'never closed with ;;'),
+            'garbage token': (GATE_VIEW.replace('    type: number\n',
+                                                '    type: number\n    ]]\n', 1), None),
+            'lone semicolon': (GATE_VIEW.replace('type: yesno', 'type: yesno ;', 1),
+                               "Unexpected ';'"),
+            'half written': (GATE_VIEW[:GATE_VIEW.index('measure: total') + 20], None),
+            'cut after the view name': ('view: orders', 'has no { } block'),
+            'cut after the explore name': (GATE_EXPLORE[:GATE_EXPLORE.index(' {')],
+                                           'explore: orders has no { } block'),
+        }
+        for name, (text, expected) in cases.items():
+            with self.subTest(name=name):
+                reason = self.check('views/orders.view.lkml', text)
+                self.assertIsNotNone(reason, 'gate let a broken file through')
+                self.assertNotIn('\n', reason)
+                if expected:
+                    self.assertIn(expected, reason)
+
+    def test_mutation_set_is_all_caught(self):
+        total, missed = 0, []
+        for path, text in GATE_CORPUS.items():
+            for name, broken in gate_mutations(text):
+                total += 1
+                if self.check(path, broken) is None:
+                    missed.append(f'{path}: {name}')
+        self.assertGreater(total, 200)
+        self.assertEqual(missed, [])
+
+    def test_braces_in_sql_html_strings_comments_pass(self):
+        text = ('view: v {\n'
+                '  # } a closing brace in a comment\n'
+                '  dimension: d {\n'
+                '    label: "{ open"\n'
+                '    sql: CASE WHEN x = \'}\' THEN \'}}\' END ;;\n'
+                '    html: {% if value %}<b>{{ value }}</b>{% endif %} ;;\n'
+                '  }\n'
+                '  measure: m {\n'
+                '    type: number\n'
+                '    sql: ${d} ;;\n'
+                '  }\n'
+                '}\n')
+        self.assertIsNone(self.gate._scan(text))
+        self.assertIsNone(self.check('views/v.view.lkml', text))
+
+    def test_sql_that_looks_like_keys_is_not_a_missing_semicolons(self):
+        text = ('view: v {\n'
+                '  derived_table: {\n'
+                '    sql: SELECT x::int AS type, \'{"label": 1}\' AS j\n'
+                '      FROM t -- type: comment\n'
+                '      WHERE a = :param ;;\n'
+                '  }\n'
+                '  dimension: d {\n'
+                '    sql: ${TABLE}.d ;;\n'
+                '  }\n'
+                '}\n')
+        self.assertIsNone(self.check('views/v.view.lkml', text))
+
+    def test_parser_logging_does_not_leak_to_stderr(self):
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+        code = (
+            'import logging\n'
+            'logging.basicConfig(level=logging.DEBUG)\n'
+            'root = logging.getLogger()\n'
+            'before = (root.level, list(root.handlers))\n'
+            'from looker_sync import gate\n'
+            'assert (root.level, list(root.handlers)) == before\n'
+            'gate.check("a.view.lkml", b"view: a { dimension: b { sql: x ;; } }")\n'
+            'gate.check("a.view.lkml", b"view: a { dimension: b sql: x ;; } }")\n'
+            'for name in ("parser", "simple", "visitors"):\n'
+            '    logging.getLogger("looker_sync._vendor.lkml." + name).warning("leak")\n'
+            'logging.getLogger("other").warning("root still works")\n'
+        )
+        env = dict(os.environ, PYTHONPATH=src)
+        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                           env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('leak', r.stderr)
+        self.assertIn('root still works', r.stderr)
+
+
+def import_cli():
+    """The CLI module, imported in-process for the connection-layer tests."""
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from looker_sync import cli
+    return cli
+
+
+class ConnectionLayerTestCase(FakeLookerTestCase):
+    """A Looker client in this process against the fake, in dev mode, closed after each test."""
+
+    def setUp(self):
+        super().setUp()
+        self.cli = import_cli()
+        self.fake.branches['feat'].update({f'views/v{i:02}.view.lkml': f'view: v{i:02} {{}}\n' for i in range(20)})
+        self.env = {'LOOKER_URL': self.url, 'LOOKER_CLIENT_ID': 'id', 'LOOKER_CLIENT_SECRET': SECRET}
+
+    def client(self):
+        L = self.cli.Looker(self.env)
+        self.addCleanup(L.close)
+        L.set_workspace('dev')
+        return L
+
+    def tearDown(self):
+        self.fake.drop_connections()
+        super().tearDown()
+
+    def logins(self):
+        return self.fake.logins
+
+    def wait_for(self, cond, seconds=5):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return cond()
+
+
+class KeepAliveTest(ConnectionLayerTestCase):
+    def test_sequential_requests_share_one_connection(self):
+        L = self.client()
+        for i in range(10):
+            self.assertEqual(L.read_file(PROJECT, f'views/v{i:02}.view.lkml'), f'view: v{i:02} {{}}\n'.encode())
+        # login, PATCH and GET /session, 10 reads: one TCP connection on both sides
+        self.assertEqual(self.fake.connections, 1)
+        self.assertEqual(L.pool.opened, 1)
+
+    def test_parallel_reads_are_correct_and_in_input_order(self):
+        L = self.client()
+        paths = [f'views/v{i:02}.view.lkml' for i in reversed(range(20))]
+        got = L.read_files(PROJECT, paths, workers=8)
+        self.assertEqual(got, [self.fake.branches['feat'][p].encode() for p in paths])
+        self.assertLessEqual(self.fake.connections, 8)
+        before = self.fake.connections
+        L.read_files(PROJECT, paths, workers=8)
+        self.assertEqual(self.fake.connections, before)   # the second round reuses the pool
+
+    def test_parallel_read_of_a_missing_file_raises(self):
+        L = self.client()
+        with self.assertRaises(self.cli.LookerError) as e:
+            L.read_files(PROJECT, ['views/v00.view.lkml', 'views/nope.view.lkml'], workers=4)
+        self.assertIn('HTTP 404', str(e.exception))
+
+    def test_status_reads_over_reused_connections(self):
+        self.init()
+        before = self.fake.connections
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # 23 files read in parallel by 8 workers, plus the calls before them: never one per request
+        self.assertLessEqual(self.fake.connections - before, 8)
+
+
+class ReconnectTest(ConnectionLayerTestCase):
+    def test_read_after_server_dropped_idle_connection(self):
+        L = self.client()
+        L.read_file(PROJECT, 'views/v00.view.lkml')
+        self.fake.drop_connections()
+        time.sleep(0.1)
+        self.assertEqual(L.read_file(PROJECT, 'views/v01.view.lkml'), b'view: v01 {}\n')
+        self.assertEqual(self.fake.connections, 2)
+
+    def test_write_after_server_dropped_idle_connection_is_sent_once(self):
+        L = self.client()
+        self.fake.drop_connections()
+        time.sleep(0.1)
+        L.call('PUT', f'/projects/{PROJECT}/files', body={'path': 'views/v00.view.lkml', 'content': 'view: new {}\n'})
+        puts = [e for e in self.fake.log if e[0] == 'PUT']
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(self.fake.dev_files()['views/v00.view.lkml'], 'view: new {}\n')
+
+    def test_fresh_connection_refused_is_a_looker_error(self):
+        L = self.client()
+        L.close()
+        self.fake.server.shutdown()
+        self.fake.server.server_close()
+        self.fake.drop_connections()
+        with self.assertRaises(self.cli.LookerError):
+            L.read_file(PROJECT, 'views/v00.view.lkml')
+        self.fake.server = mock.Mock()   # tearDown already has nothing to stop
+
+
+class TokenRefreshTest(ConnectionLayerTestCase):
+    def test_401_logs_in_again_and_retries_once(self):
+        L = self.client()
+        old = L.token
+        self.fake.tokens.pop(old)        # Looker forgets the token mid-run
+        self.assertEqual(L.read_file(PROJECT, 'views/v00.view.lkml'), b'view: v00 {}\n')
+        self.assertNotEqual(L.token, old)
+        self.assertEqual(self.fake.tokens[L.token], 'dev')   # the new token is back in dev mode
+
+    def test_second_401_raises_auth_expired(self):
+        L = self.client()
+        self.fake.force_401 = 2
+        with self.assertRaises(self.cli.AuthExpired) as e:
+            L.read_file(PROJECT, 'views/v00.view.lkml')
+        self.assertIsInstance(e.exception, self.cli.LookerError)   # one-shot commands exit 1
+        self.assertNotIn(L.token, str(e.exception))
+
+    def test_cli_exits_1_when_looker_keeps_answering_401(self):
+        self.init()
+        self.fake.force_401 = 1000
+        r = self.run_cli('status')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('HTTP 401 again after a fresh login', r.stdout)
+        self.assertNotIn('tok', r.stdout)
+
+    def test_lazy_refresh_after_80_percent_of_expires_in(self):
+        self.fake.expires_in = 1
+        L = self.client()
+        old, logins = L.token, self.logins()
+        L.read_file(PROJECT, 'views/v00.view.lkml')
+        self.assertEqual(L.token, old)   # before 0.8 s: no refresh
+        time.sleep(0.85)
+        L.read_file(PROJECT, 'views/v00.view.lkml')
+        self.assertNotEqual(L.token, old)
+        self.assertEqual(self.logins(), logins + 1)
+        self.assertEqual(self.fake.tokens[L.token], 'dev')
+
+    def test_background_refresh_swaps_token_without_requests(self):
+        self.fake.expires_in = 1
+        L = self.client()
+        seen = []
+        L.before_token_swap = lambda tok: seen.append((tok, self.fake.tokens[tok]))
+        old = L.token
+        L.start_auto_refresh()
+        self.assertTrue(self.wait_for(lambda: L.token != old, 3))
+        L.stop_auto_refresh()
+        # the hook ran before the swap, on the new token already in dev mode
+        self.assertEqual(seen[0], (L.token, 'dev'))
+
+    def test_hook_refusing_the_swap_keeps_the_old_token(self):
+        self.fake.expires_in = 1
+        L = self.client()
+        errors = []
+        old = L.token
+
+        def refuse(tok):
+            raise self.cli.Refused('branch moved')
+        L.before_token_swap = refuse
+        L.on_refresh_error = errors.append
+        L.start_auto_refresh()
+        self.assertTrue(self.wait_for(lambda: errors, 3))
+        L.stop_auto_refresh()
+        self.assertEqual(L.token, old)
+        self.assertIsInstance(errors[0], self.cli.Refused)
+
+
+class WatchCoreTestCase(unittest.TestCase):
+    """WatchCore with a fake clock and an inline fake worker: no network, no threads."""
+
+    def setUp(self):
+        self.cli = _import_cli()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, 'proj')
+        os.makedirs(os.path.join(self.root, '.looker-sync'))
+        with open(os.path.join(self.root, '.looker-sync', 'config.json'), 'w') as f:
+            f.write('{}')
+        self.wall = time.time_ns()
+        self.now = 0.0
+        self.pushes, self.events = [], []
+        self.remote = {}
+        self.answer = None      # what the fake push_one returns or raises
+
+    def tearDown(self):
+        for dirpath, dirnames, _ in os.walk(self.tmp.name):
+            for d in dirnames:
+                os.chmod(os.path.join(dirpath, d), 0o755)
+        self.tmp.cleanup()
+
+    def put(self, rel, text, old=True, synced=False):
+        full = os.path.join(self.root, *rel.split('/'))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'wb') as f:
+            f.write(text.encode())
+        if old:
+            t = self.wall - 100 * 10**9
+            os.utime(full, ns=(t, t))
+        if synced:
+            self.remote[rel] = hashlib.sha256(text.encode()).hexdigest()
+        return full
+
+    def push_one(self, rel, data):
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        if self.answer is None:
+            self.pushes.append((rel, data.decode()))
+        return self.answer
+
+    def core(self, **kw):
+        kw.setdefault('gate', lambda rel, data: None)
+        self.c = self.cli.WatchCore(
+            self.cli.Project(self.root), self.push_one, remote_state=lambda: dict(self.remote),
+            on_event=lambda kind, text, paths: self.events.append((kind, text, tuple(paths))),
+            clock=lambda: self.now, wall_ns=lambda: self.wall, threaded=False, **kw)
+        return self.c
+
+    def at(self, t):
+        self.now = t
+        return self.c.tick()
+
+    def kinds(self, kind):
+        return [e for e in self.events if e[0] == kind]
+
+    def held(self, word):
+        return [e for e in self.kinds('held') if word in e[1]]
+
+
+class WatchSettleTest(WatchCoreTestCase):
+
+    def test_in_place_save_waits_150_ms(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.assertIsNone(self.at(0))
+        with open(full, 'ab') as f:
+            f.write(b'# more\n')
+        self.assertIsNone(self.at(5.0))
+        self.assertIsNone(self.at(5.1))
+        self.assertEqual(self.at(5.16), {'a.view.lkml': b'view: a {}\n# more\n'})
+        self.assertEqual(self.pushes, [('a.view.lkml', 'view: a {}\n# more\n')])
+        self.assertIsNone(self.at(6))
+
+    def test_atomic_rename_is_pushed_at_once(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        self.put('.a.view.lkml.swp', 'view: a { }\n', old=False)
+        os.replace(os.path.join(self.root, '.a.view.lkml.swp'),
+                   os.path.join(self.root, 'a.view.lkml'))
+        self.assertEqual(self.at(5.0), {'a.view.lkml': b'view: a { }\n'})
+
+    def test_five_paths_in_one_scan_is_a_burst(self):
+        for i in range(5):
+            self.put(f'v{i}.view.lkml', f'view: v{i} {{}}\n', synced=True)
+        self.core()
+        self.at(0)
+        for i in range(5):
+            self.put(f'v{i}.view.lkml', f'view: v{i} {{ }}\n', old=False)
+        self.assertIsNone(self.at(5.0))
+        self.assertIsNone(self.at(5.3))
+        self.assertEqual(len(self.at(5.5)), 5)
+
+    def test_repeat_writer_waits_two_and_a_half_gaps(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        for t in (5.0, 5.4):
+            with open(full, 'ab') as f:
+                f.write(b'#\n')
+            self.assertIsNone(self.at(t))
+        self.assertIsNone(self.at(6.3))      # 5.4 + clamp(2.5 x 0.4) = 6.4
+        self.assertIsNotNone(self.at(6.41))
+
+    def test_noisy_file_is_pushed_within_max_wait(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        t, got = 5.0, None
+        while got is None and t < 9:
+            with open(full, 'ab') as f:
+                f.write(b'#\n')
+            got = self.at(t)
+            t += 0.3
+        self.assertIsNotNone(got)
+        self.assertLessEqual(t - 0.3, 5.0 + 3.0 + 0.3)   # max_wait, plus one tick
+
+    def test_scan_interval_follows_scan_cost(self):
+        self.core(poll=0.05)
+        self.at(0)
+        self.assertEqual(self.c.interval, max(0.05, 9 * self.c.scan_duration))
+
+    def test_same_size_write_in_the_same_mtime_tick_is_rechecked(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        with open(full, 'wb') as f:
+            f.write(b'view: b {}\n')
+        os.utime(full, ns=(self.wall, self.wall))     # mtime == "now": one tick of the read
+        self.at(5.0)
+        self.assertEqual(self.at(5.2), {'a.view.lkml': b'view: b {}\n'})
+        ino = os.stat(full).st_ino
+        with open(full, 'r+b') as f:                  # same size, same inode, same mtime
+            f.write(b'view: c {}\n')
+        os.utime(full, ns=(self.wall, self.wall))
+        self.assertEqual(os.stat(full).st_ino, ino)
+        self.assertIsNone(self.at(5.25))             # seen; a repeat within 1 s settles
+        self.assertEqual(self.at(5.9), {'a.view.lkml': b'view: c {}\n'})
+
+    def test_touch_without_new_bytes_is_no_work(self):
+        for i in range(4):
+            self.put(f'v{i}.view.lkml', f'view: v{i} {{}}\n', synced=True)
+        self.core(ceiling=2)
+        self.at(0)
+        for i in range(4):
+            os.utime(os.path.join(self.root, f'v{i}.view.lkml'))
+        for t in (5, 5.6, 6.2):
+            self.assertIsNone(self.at(t))
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.kinds('held'), [])
+
+    def test_ignored_names_are_never_pushed(self):
+        self.core()
+        self.at(0)
+        for name in ('.#a.view.lkml', '~a.view.lkml', '#a.view.lkml#', '._a.view.lkml'):
+            self.put(name, 'view: x {}\n', old=False)
+        self.put('real.view.lkml', 'view: real {}\n')
+        self.at(5)
+        self.assertEqual(self.pushes, [('real.view.lkml', 'view: real {}\n')])
+
+
+class WatchHoldTest(WatchCoreTestCase):
+
+    def test_move_is_held_never_written_or_deleted(self):
+        for i in range(3):
+            self.put(f'old/v{i}.view.lkml', f'view: v{i} {{}}\n', synced=True)
+        self.core()
+        self.at(0)
+        os.rename(os.path.join(self.root, 'old'), os.path.join(self.root, 'new'))
+        for t in (5, 5.6, 6.2):
+            self.assertIsNone(self.at(t))
+        self.assertEqual(self.pushes, [])
+        moves = self.held('moved')
+        self.assertEqual(len(moves), 1)
+        self.assertIn('old/v0.view.lkml -> new/v0.view.lkml', moves[0][2])
+        self.assertEqual(self.held('deleted locally'), [])
+
+    def test_delete_is_reported_once_never_synced(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.put('b.view.lkml', 'view: b {}\n', synced=True)
+        self.core()
+        self.at(0)
+        os.remove(os.path.join(self.root, 'a.view.lkml'))
+        for t in (5, 6, 7):
+            self.at(t)
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(len(self.held('deleted locally')), 1)
+
+    def test_copy_of_a_live_file_is_a_suspect(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        self.put('copy.view.lkml', 'view: a {}\n', old=False)
+        self.at(5)
+        self.at(5.2)
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(len(self.held('copy')), 1)
+
+    def test_ceiling_holds_and_tells_the_user_to_push(self):
+        for i in range(4):
+            self.put(f'v{i}.view.lkml', f'view: v{i} {{}}\n', synced=True)
+        self.core(ceiling=3)
+        self.at(0)
+        for i in range(4):
+            self.put(f'v{i}.view.lkml', f'view: v{i} {{ }}\n', old=False)
+        self.at(5)
+        self.at(5.6)
+        self.assertEqual(self.pushes, [])
+        self.assertIn('looker-sync push', self.held('more than 3')[0][1])
+        self.put('v0.view.lkml', 'view: v0 {}\n', old=False)   # back under the ceiling
+        self.at(7)
+        self.at(7.2)
+        self.assertEqual(sorted(p for p, _ in self.pushes),
+                         ['v1.view.lkml', 'v2.view.lkml', 'v3.view.lkml'])
+
+    def test_one_syntax_error_holds_every_pending_file(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.put('b.view.lkml', 'view: b {}\n', synced=True)
+        self.core(gate=lambda rel, data: 'broken' if b'BAD' in data else None)
+        self.at(0)
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.put('b.view.lkml', 'view: b { BAD\n', old=False)
+        self.at(5)
+        self.at(5.6)
+        self.assertEqual(self.pushes, [])
+        self.assertIn('b.view.lkml: broken', self.held('syntax')[0][2])
+        self.put('b.view.lkml', 'view: b { }\n', old=False)
+        self.assertIsNone(self.at(7))        # the fix is still settling: a stays held
+        self.assertEqual(sorted(self.at(7.2)), ['a.view.lkml', 'b.view.lkml'])
+        self.assertTrue(self.kinds('released'))
+
+    def test_default_gate_holds_broken_lookml(self):
+        self.core(gate=None)
+        if self.c.gate('x.view.lkml', b'view: x {') is None:
+            self.skipTest('gate module not importable')
+        self.at(0)
+        self.put('x.view.lkml', 'view: x {\n', old=False)
+        self.at(5)
+        self.at(5.2)
+        self.assertEqual(self.pushes, [])
+
+    def test_git_operation_holds_then_quiet_period(self):
+        git = os.path.join(self.root, '.git')
+        os.makedirs(git)
+        with open(os.path.join(git, 'HEAD'), 'w') as f:
+            f.write('ref: refs/heads/main\n')
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        open(os.path.join(git, 'index.lock'), 'w').close()
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.assertIsNone(self.at(5))
+        self.assertIsNone(self.at(5.5))
+        os.remove(os.path.join(git, 'index.lock'))
+        self.assertIsNone(self.at(5.6))      # quiet 0.3 s after git stops
+        self.assertIsNotNone(self.at(5.81))
+        self.assertTrue(self.held('git is busy'))
+
+    def test_head_moving_holds(self):
+        git = os.path.join(self.root, '.git')
+        os.makedirs(git)
+        with open(os.path.join(git, 'HEAD'), 'w') as f:
+            f.write('ref: refs/heads/main\n')
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        with open(os.path.join(git, 'HEAD'), 'w') as f:
+            f.write('ref: refs/heads/other\n')
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.assertIsNone(self.at(5.2))
+        self.assertIn('HEAD moved', self.held('git')[0][1])
+
+    def test_root_gone_pauses_and_resumes(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        away = self.root + '-away'
+        os.rename(self.root, away)
+        os.makedirs(self.root)                  # an empty mount point in its place
+        self.assertIsNone(self.at(5))
+        self.assertEqual(len(self.kinds('paused')), 1)
+        os.rmdir(self.root)
+        os.rename(away, self.root)
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.at(6)
+        self.assertIsNotNone(self.at(6.2))
+        self.assertEqual(len(self.kinds('resumed')), 1)
+
+    def test_missing_config_pauses(self):
+        self.core()
+        self.at(0)
+        os.remove(os.path.join(self.root, '.looker-sync', 'config.json'))
+        self.at(1)
+        self.assertIn('config.json', self.kinds('paused')[0][1])
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root reads anything')
+    def test_unreadable_folder_is_not_deleted(self):
+        self.put('sub/a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        os.chmod(os.path.join(self.root, 'sub'), 0)
+        for t in (5, 6):
+            self.at(t)
+        self.assertEqual(self.held('deleted'), [])
+        self.assertEqual(self.pushes, [])
+
+    def test_external_pause_and_resume(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        self.c.pause('branch mismatch')
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.at(5)
+        self.assertIsNone(self.at(5.2))
+        self.assertEqual(self.kinds('paused')[0][1], 'branch mismatch')
+        self.c.resume()
+        self.assertIsNotNone(self.at(5.4))
+        self.assertTrue(self.kinds('resumed'))
+
+    def test_hold_check_holds_every_push(self):
+        reason = ['branch moved']
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core(hold_check=lambda: reason[0])
+        self.at(0)
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.at(5)
+        self.assertIsNone(self.at(5.2))
+        reason[0] = None
+        self.assertIsNotNone(self.at(5.4))
+
+
+class WatchWorkerTest(WatchCoreTestCase):
+
+    def test_push_one_hold_waits_for_new_local_bytes(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        self.answer = 'changed in Looker since last sync'
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.at(5)
+        self.at(5.2)
+        self.answer = None
+        self.assertIsNone(self.at(6))         # same bytes: still held
+        self.assertTrue(self.held('held by Looker'))
+        self.put('a.view.lkml', 'view: a {  }\n', old=False)
+        self.at(8)
+        self.assertIsNotNone(self.at(8.2))
+
+    def test_push_error_backs_off_then_retries(self):
+        self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        self.core()
+        self.at(0)
+        self.answer = LookupError('network down')
+        self.put('a.view.lkml', 'view: a { }\n', old=False)
+        self.at(5)
+        self.at(5.2)
+        self.assertEqual(len(self.kinds('error')), 1)
+        self.answer = None
+        self.assertIsNone(self.at(5.5))       # backoff 1 s
+        self.assertIsNotNone(self.at(6.3))
+        self.assertEqual(self.pushes, [('a.view.lkml', 'view: a { }\n')])
+        self.assertIsNone(self.at(7))
+
+    def test_hung_push_never_blocks_the_scanner_and_latest_bytes_win(self):
+        full = self.put('a.view.lkml', 'view: a {}\n', synced=True)
+        gate_open = threading.Event()
+        pushes = []
+
+        def push_one(rel, data):
+            pushes.append(data)
+            gate_open.wait(10)
+        core = self.cli.WatchCore(self.cli.Project(self.root), push_one,
+                                  remote_state=lambda: dict(self.remote),
+                                  gate=lambda rel, data: None, poll=0.01)
+        scans = []
+        real_scan = core.proj.scan
+
+        def counting_scan(previous=None):
+            scans.append(1)
+            return real_scan(previous)
+        core.proj.scan = counting_scan
+        core.start()
+        try:
+            with open(full, 'ab') as f:
+                f.write(b'# 1\n')
+            deadline = time.time() + 5
+            while not pushes and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(pushes), 1)
+            before = len(scans)
+            for i in range(2, 6):
+                with open(full, 'ab') as f:
+                    f.write(f'# {i}\n'.encode())
+                time.sleep(0.05)
+            self.assertGreater(len(scans) - before, 5)   # scanner kept running
+            gate_open.set()
+            deadline = time.time() + 5
+            while len(pushes) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.3)
+        finally:
+            gate_open.set()
+            core.stop()
+        with open(full, 'rb') as f:
+            latest = f.read()
+        self.assertEqual(len(pushes), 2)
+        self.assertEqual(pushes[-1], latest)
 
 if __name__ == '__main__':
     unittest.main()

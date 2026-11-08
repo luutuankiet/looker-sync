@@ -25,17 +25,27 @@ commit Looker is on. Without `git_remote` no git process is ever started.
 Exit codes: 0 ok, 1 Looker or network error, 2 refused by a guard, 3 validation errors.
 """
 import argparse
+import collections
 import datetime
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+# connection layer (keep-alive pool, parallel reads, token refresh)
+import concurrent.futures
+import http.client
+import socket
+import ssl
+import threading
 
 META_DIR = '.looker-sync'
 DEFAULT_INCLUDE = ['**/*.lkml', '**/*.dashboard.lookml']
@@ -80,39 +90,268 @@ def load_env(path):
     return env
 
 
-class Looker:
-    """One login per command run. The token lives in memory only."""
+class AuthExpired(LookerError):
+    """Looker still answers HTTP 401 after a fresh login, or the fresh login itself failed.
 
-    def __init__(self, env):
+    A one-shot command exits 1 on it like any LookerError; watch catches it to pause.
+    """
+
+
+class ConnectionPool:
+    """Keep-alive HTTP(S) connections to one Looker host, safe to share between threads.
+
+    Each connection is used by one thread at a time: a request takes an idle one (or opens
+    a new one) and gives it back when the response is fully read. Every request therefore
+    runs on its own connection, and the pool grows to the number of threads in flight.
+    """
+
+    IDEMPOTENT = ('GET', 'HEAD', 'OPTIONS')
+    MAX_IDLE = 16
+
+    def __init__(self, base_url, timeout=120):
+        u = urllib.parse.urlsplit(base_url)
+        if u.scheme not in ('http', 'https') or not u.hostname:
+            raise LookerError(f'LOOKER_URL must start with http:// or https://, got {base_url!r}')
+        self.scheme, self.host = u.scheme, u.hostname
+        self.port = u.port or (443 if u.scheme == 'https' else 80)
+        self.prefix = u.path.rstrip('/')
+        self.timeout = timeout
+        # urlopen honoured *_proxy and no_proxy; keep that by tunnelling through the proxy
+        proxy = urllib.request.getproxies().get(u.scheme)
+        self.proxy = None
+        if proxy and not urllib.request.proxy_bypass(self.host):
+            p = urllib.parse.urlsplit(proxy if '://' in proxy else 'http://' + proxy)
+            self.proxy = (p.hostname, p.port or 80)
+        self._ssl = ssl.create_default_context() if u.scheme == 'https' else None
+        self._idle = []
+        self._lock = threading.Lock()
+        self.opened = 0              # connections opened so far; tests and timings read it
+
+    def _open(self):
+        host, port = self.proxy or (self.host, self.port)
+        if self.scheme == 'https':
+            conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=self._ssl)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+        if self.proxy:
+            conn.set_tunnel(self.host, self.port)
+        with self._lock:
+            self.opened += 1
+        return conn
+
+    def _acquire(self):
+        with self._lock:
+            if self._idle:
+                return self._idle.pop(), True
+        return self._open(), False
+
+    def _release(self, conn):
+        with self._lock:
+            if len(self._idle) < self.MAX_IDLE:
+                self._idle.append(conn)
+                return
+        conn.close()
+
+    def close(self):
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            conn.close()
+
+    def request(self, method, path, data=None, headers=None):
+        """(status, body bytes) for any HTTP status; LookerError for a network failure."""
+        for attempt in (1, 2):
+            conn, reused = self._acquire()
+            got_response = False
+            try:
+                if conn.sock is None:
+                    conn.connect()
+                    try:   # newer http.client does this itself; older ones stall ~40 ms per write
+                        conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except (OSError, AttributeError):
+                        pass
+                conn.request(method, self.prefix + path, body=data, headers=headers or {})
+                resp = conn.getresponse()
+                got_response = True
+                payload = resp.read()
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError, socket.timeout) as e:
+                conn.close()
+                # Retry once, and only on a connection that sat in the pool: a server or proxy
+                # may close an idle keep-alive connection, and the client finds out only when it
+                # reuses it. A fresh connection failing is a real error.
+                # Reads are safe to repeat whatever happened. A write (POST, PUT, PATCH, DELETE)
+                # is repeated only if not a single response byte was read and the error is a
+                # dead connection, not a timeout: on a closed idle connection the server never
+                # saw the request. The remaining risk, a server that applied the write and then
+                # dropped the connection before answering, would repeat an identical write
+                # (same path, same bytes), and the read-back after every push still checks it.
+                timed_out = isinstance(e, socket.timeout)
+                retry = reused and attempt == 1 and (
+                    method in self.IDEMPOTENT or (not got_response and not timed_out))
+                if retry:
+                    continue
+                raise LookerError(f'{method} {path}: {e or type(e).__name__}')
+            except (OSError, http.client.HTTPException) as e:
+                conn.close()
+                raise LookerError(f'{method} {path}: {e or type(e).__name__}')
+            if resp.will_close:
+                conn.close()
+            else:
+                self._release(conn)
+            if 300 <= resp.status < 400:
+                # urlopen followed redirects; an API call that redirects means LOOKER_URL is off
+                raise LookerError(f'{method} {path}: HTTP {resp.status} redirect to '
+                                  f'{resp.getheader("Location")}; set LOOKER_URL to the address it names')
+            return resp.status, payload
+
+
+class Looker:
+    """One API client per process: a keep-alive connection pool and one in-memory token.
+
+    The token is shared by every thread and connection. It is refreshed (a new login, then the
+    session workspace set again on the new token, then an atomic swap) once 80% of its
+    `expires_in` has passed: lazily before the next request, or by the opt-in background thread
+    (`start_auto_refresh`, which watch uses). An HTTP 401 triggers one refresh and one retry; a
+    second 401 raises AuthExpired. The token is never printed and never written to disk.
+    """
+
+    REFRESH_AT = 0.8
+
+    def __init__(self, env, timeout=120):
         url = env['LOOKER_URL'].rstrip('/')
         self.base = url if url.endswith('/api/4.0') else url + '/api/4.0'
-        body = urllib.parse.urlencode({'client_id': env['LOOKER_CLIENT_ID'],
-                                       'client_secret': env['LOOKER_CLIENT_SECRET']}).encode()
-        status, payload = self._send('POST', '/login', body, {'Content-Type': 'application/x-www-form-urlencoded'})
+        self.pool = ConnectionPool(self.base, timeout)
+        self._form = urllib.parse.urlencode({'client_id': env['LOOKER_CLIENT_ID'],
+                                             'client_secret': env['LOOKER_CLIENT_SECRET']}).encode()
+        self.workspace = None        # set by set_workspace; a refresh sets it again on the new token
+        # Called as before_token_swap(new_token) after the new token is in the right workspace and
+        # before it replaces the old one; raise to keep the old token (watch checks the branch here).
+        self.before_token_swap = None
+        self.on_refresh_error = None  # called with the exception when a background refresh fails
+        self._refresh_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._refresher = None
+        self._auth = self._login()   # (token, monotonic time to refresh at)
+
+    # ---- token
+
+    @property
+    def token(self):
+        return self._auth[0]
+
+    def _login(self):
+        started = time.monotonic()
+        status, payload = self.pool.request('POST', '/login', self._form,
+                                            {'Content-Type': 'application/x-www-form-urlencoded'})
         if status != 200:
             # The request carried the secret; the response never does, but keep it terse anyway.
             raise LookerError(f'login failed: HTTP {status}')
-        self.token = json.loads(payload)['access_token']
+        res = json.loads(payload)
+        expires = res.get('expires_in')
+        due = started + self.REFRESH_AT * float(expires) if expires else float('inf')
+        return res['access_token'], due
+
+    def set_workspace(self, workspace_id):
+        """PATCH /session to the workspace, confirm it, and remember it for every refresh."""
+        self._set_workspace(workspace_id, None)
+        self.workspace = workspace_id
+
+    def _set_workspace(self, want, token):
+        self.call('PATCH', '/session', body={'workspace_id': want}, token=token)
+        got = (self.call('GET', '/session', token=token) or {}).get('workspace_id')
+        if got != want:
+            raise LookerError(f'session workspace is {got!r} after asking for {want!r}')
+
+    def refresh(self, stale=None):
+        """Log in again, put the new token in the workspace, then swap it in.
+
+        `stale` is the token the caller saw fail or expire; if another thread has already
+        replaced it, nothing is done. Raises AuthExpired if the new login is refused.
+        """
+        with self._refresh_lock:
+            if stale is not None and self._auth[0] != stale:
+                return
+            try:
+                auth = self._login()
+            except LookerError as e:
+                if 'login failed' in str(e):
+                    raise AuthExpired(f'{e}; check LOOKER_CLIENT_ID and LOOKER_CLIENT_SECRET') from None
+                raise
+            if self.workspace:
+                self._set_workspace(self.workspace, auth[0])
+            if self.before_token_swap:
+                self.before_token_swap(auth[0])
+            self._auth = auth        # one assignment: every thread sees the old or the new pair
+
+    def _token_for_request(self):
+        token, due = self._auth
+        if time.monotonic() >= due:
+            try:
+                self.refresh(stale=token)
+            except LookerError:
+                pass                 # the old token may still work; a 401 retries the refresh
+            token = self._auth[0]
+        return token
+
+    def start_auto_refresh(self):
+        """Refresh in a background thread at 80% of the token lifetime. Watch only; idempotent."""
+        if self._refresher:
+            return
+        self._stop.clear()
+        self._refresher = threading.Thread(target=self._refresh_loop, name='looker-token-refresh',
+                                           daemon=True)
+        self._refresher.start()
+
+    def stop_auto_refresh(self):
+        self._stop.set()
+        if self._refresher:
+            self._refresher.join(timeout=5)
+        self._refresher = None
+
+    def _refresh_loop(self):
+        while not self._stop.is_set():
+            token, due = self._auth
+            if self._stop.wait(max(0.0, min(due - time.monotonic(), 3600.0))):
+                return
+            if self._auth[0] != token or time.monotonic() < due:
+                continue
+            try:
+                self.refresh(stale=token)
+            except Exception as e:   # keep the loop alive; requests still refresh on 401
+                if self.on_refresh_error:
+                    self.on_refresh_error(e)
+                self._stop.wait(30)
+
+    def close(self):
+        self.stop_auto_refresh()
+        self.pool.close()
+
+    # ---- requests
 
     def _send(self, method, path, data=None, headers=None):
-        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers or {})
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-        except (urllib.error.URLError, OSError) as e:
-            raise LookerError(f'{method} {path}: {e}')
+        return self.pool.request(method, path, data, headers)
 
-    def try_call(self, method, path, query=None, body=None, raw=False):
+    def try_call(self, method, path, query=None, body=None, raw=False, token=None):
+        """(status, payload); an HTTP error is (status, message), a network error LookerError.
+
+        `token` sends the request with that token, without the 401 refresh (used while a
+        refresh prepares a new token).
+        """
         if query:
             path += '?' + urllib.parse.urlencode(query)
-        headers = {'Authorization': 'token ' + self.token}
         data = None
+        headers = {}
         if body is not None:
             data = json.dumps(body).encode()
             headers['Content-Type'] = 'application/json'
-        status, payload = self._send(method, path, data, headers)
+        use = token or self._token_for_request()
+        status, payload = self._send(method, path, data, dict(headers, Authorization='token ' + use))
+        if status == 401 and token is None:
+            self.refresh(stale=use)
+            status, payload = self._send(method, path, data, dict(headers, Authorization='token ' + self.token))
+            if status == 401:
+                raise AuthExpired(f'{method} {path.split("?")[0]} -> HTTP 401 again after a fresh login')
         if status >= 400:
             try:
                 msg = json.loads(payload).get('message') or payload.decode(errors='replace')
@@ -123,11 +362,35 @@ class Looker:
             return status, payload
         return status, json.loads(payload) if payload else None
 
-    def call(self, method, path, query=None, body=None, raw=False):
-        status, payload = self.try_call(method, path, query, body, raw)
+    def call(self, method, path, query=None, body=None, raw=False, token=None):
+        status, payload = self.try_call(method, path, query, body, raw, token)
         if status >= 400:
             raise LookerError(f'{method} {path.split("?")[0]} -> HTTP {status}: {payload}')
         return payload
+
+    def parallel(self, fn, items, workers=8):
+        """[fn(item) for item in items] on up to `workers` threads over the pool, in input order.
+
+        The first exception is raised once the calls already started have finished.
+        """
+        items = list(items)
+        if workers <= 1 or len(items) <= 1:
+            return [fn(i) for i in items]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+            futures = [ex.submit(fn, i) for i in items]
+            try:
+                return [f.result() for f in futures]
+            except BaseException:
+                for f in futures:
+                    f.cancel()
+                raise
+
+    def read_file(self, project, path):
+        return self.call('GET', f'/projects/{project}/file/content', {'file_path': path}, raw=True)
+
+    def read_files(self, project, paths, workers=8):
+        """[bytes] for each path of a Looker project, read in parallel, in input order."""
+        return self.parallel(lambda p: self.read_file(project, p), paths, workers)
 
 
 # ---------------------------------------------------------------- project folder
@@ -146,6 +409,158 @@ def glob_regex(pattern):
         else:
             rx, i = rx + re.escape(pattern[i]), i + 1
     return re.compile(rx + r'\Z')
+
+
+# Local scan. Two pieces, so a watcher can poll cheaply and read only what changed:
+#   scan_tree    stat only (os.scandir), no file is opened, so a FIFO cannot block it
+#   read_stable  one verified read of one file
+# Names starting with '.', '~' or '#' are never synced, at any depth: editor temps and lock
+# files ('.#x.lkml', '._x.lkml', '~x.lkml', '#x.lkml#') and hidden folders ('.git').
+
+ScanEntry = collections.namedtuple('ScanEntry', 'path mtime_ns size ino dev')
+ScanEntry.__doc__ = """One regular file seen by scan_tree: its path relative to the root ('/'
+separated) and the stat fields that tell a changed file from an unchanged one."""
+
+Scan = collections.namedtuple('Scan', 'entries unreadable carried started_ns')
+Scan.__doc__ = """Result of scan_tree.
+entries     {relative path: ScanEntry} for every regular file in the sync set
+unreadable  sorted relative folder paths ('' for the root) that could not be listed; their
+            files are unknown, NOT absent
+carried     paths in entries copied from the previous scan because their folder could not be
+            listed this time
+started_ns  time.time_ns() just before the scan, to spot an mtime within one tick of it"""
+
+ReadResult = collections.namedtuple('ReadResult', 'status data entry')
+ReadResult.__doc__ = """Result of read_stable.
+status  'ok'           data is the whole file and nothing changed while reading
+        'vanished'     the path no longer exists (or is a dangling symlink)
+        'unstable'     size, mtime or inode changed during the read, or the path now names
+                       another file; read again later
+        'not_regular'  FIFO, socket, device, folder or symlink loop; never synced
+        'unreadable'   permission denied or another OS error
+data    the bytes when status is 'ok', else None
+entry   ScanEntry from the fstat after the read when status is 'ok' or 'unstable', else None"""
+
+
+def ignored_name(name):
+    """True for a file or folder name that is never synced: it starts with '.', '~' or '#'."""
+    return name[:1] in ('.', '~', '#')
+
+
+def _entry(rel, st):
+    return ScanEntry(rel, st.st_mtime_ns, st.st_size, st.st_ino, st.st_dev)
+
+
+def scan_tree(root, synced, previous=None):
+    """Stat every file under root without opening any; return a Scan.
+
+    synced(rel) decides the sync set. Hidden and ignored names (see ignored_name) are skipped
+    and their folders not entered; symlinked folders are not followed (as os.walk does), a
+    symlink to a regular file counts as that file. Skipped without error: FIFOs, sockets,
+    devices, dangling symlinks, symlink loops, and anything that vanishes mid-scan (ENOENT).
+    A folder that cannot be listed goes into Scan.unreadable; when `previous` (an earlier Scan
+    or its entries dict) is given, its entries under that folder are kept and listed in
+    Scan.carried, so a caller never mistakes them for deleted files.
+    """
+    started = time.time_ns()
+    entries, unreadable = {}, []
+    stack = ['']
+    while stack:
+        rel_dir = stack.pop()
+        full_dir = os.path.join(root, *rel_dir.split('/')) if rel_dir else root
+        try:
+            it = os.scandir(full_dir)
+        except FileNotFoundError:
+            if not rel_dir:
+                unreadable.append(rel_dir)  # the root itself is gone: unknown, not empty
+            continue                        # folder vanished between listing and entering
+        except OSError:
+            unreadable.append(rel_dir)      # EACCES, ENOTDIR raced in, EIO, ...
+            continue
+        with it:
+            while True:
+                try:
+                    e = next(it)
+                except StopIteration:
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    unreadable.append(rel_dir)
+                    break
+                if ignored_name(e.name):
+                    continue
+                rel = f'{rel_dir}/{e.name}' if rel_dir else e.name
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(rel)
+                        continue
+                    if not synced(rel):
+                        continue
+                    st = e.stat(follow_symlinks=True)
+                except OSError:
+                    continue                # vanished, dangling symlink, loop (ELOOP), EACCES
+                if stat.S_ISREG(st.st_mode):
+                    entries[rel] = _entry(rel, st)
+    unreadable.sort()
+    carried = []
+    if previous is not None and unreadable:
+        prev = previous.entries if isinstance(previous, Scan) else previous
+        for path, ent in prev.items():
+            if path in entries:
+                continue
+            if any(d == '' or path.startswith(d + '/') for d in unreadable):
+                entries[path] = ent
+                carried.append(path)
+    return Scan(entries, unreadable, sorted(carried), started)
+
+
+def read_stable(full_path, rel=None):
+    """Read one file without ever blocking, and prove nothing changed while reading.
+
+    Opens with O_NONBLOCK (a FIFO returns at once instead of waiting for a writer), checks
+    S_ISREG on the open descriptor, reads to EOF, fstats again and finally stats the path.
+    Returns a ReadResult; never raises for a vanished, special or changing file.
+    """
+    rel = full_path if rel is None else rel
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOCTTY', 0)
+    try:
+        fd = os.open(full_path, flags)
+    except FileNotFoundError:
+        return ReadResult('vanished', None, None)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENXIO, errno.EISDIR):
+            return ReadResult('not_regular', None, None)   # ENXIO: a socket
+        return ReadResult('unreadable', None, None)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return ReadResult('not_regular', None, None)
+        chunks = []
+        while True:
+            chunk = os.read(fd, max(before.st_size, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+    except OSError:
+        return ReadResult('unreadable', None, None)
+    finally:
+        os.close(fd)
+    data = b''.join(chunks)
+    entry = _entry(rel, after)
+    key = lambda s: (s.st_size, s.st_mtime_ns, s.st_ino, s.st_dev)  # noqa: E731
+    if key(before) != key(after) or len(data) != after.st_size:
+        return ReadResult('unstable', None, entry)
+    try:
+        now = os.stat(full_path)
+    except FileNotFoundError:
+        return ReadResult('vanished', None, None)
+    except OSError:
+        return ReadResult('unstable', None, entry)
+    if (now.st_ino, now.st_dev) != (after.st_ino, after.st_dev):
+        return ReadResult('unstable', None, entry)     # replaced (atomic save) while reading
+    return ReadResult('ok', data, entry)
 
 
 class Project:
@@ -184,25 +599,54 @@ class Project:
         return self.config
 
     def synced(self, path):
-        """True if the path is in the sync set. The metadata folder never is."""
-        if path.split('/')[0] == META_DIR:
+        """True if the path is in the sync set. The metadata folder never is, nor any path with
+        a name part starting with '.', '~' or '#' (editor temps, hidden folders)."""
+        parts = path.split('/')
+        if parts[0] == META_DIR or any(ignored_name(p) for p in parts):
             return False
         cfg = self.config or {}
         inc = [glob_regex(p) for p in cfg.get('include', DEFAULT_INCLUDE)]
         exc = [glob_regex(p) for p in cfg.get('exclude', [])]
         return any(r.match(path) for r in inc) and not any(r.match(path) for r in exc)
 
-    def local_files(self):
+    def full_path(self, rel):
+        return os.path.join(self.root, *rel.split('/'))
+
+    def scan(self, previous=None):
+        """Stat-only Scan of the sync set (scan_tree with this project's rules); reads nothing."""
+        return scan_tree(self.root, self.synced, previous)
+
+    def read_entry(self, rel):
+        """read_stable for one relative path of the sync set."""
+        return read_stable(self.full_path(rel), rel)
+
+    def local_files(self, retries=3):
+        """{path: bytes} for every regular file in the sync set, from scan() plus read_entry().
+
+        Skips FIFOs, sockets, dangling symlinks and files that vanish before they are read.
+        Refuses (rather than report files as absent, which a push --delete would act on) when a
+        folder cannot be listed or a file cannot be read, and when a file keeps changing
+        while it is read.
+        """
+        result = self.scan()
+        if result.unreadable:
+            names = ', '.join(d or '.' for d in result.unreadable)
+            raise Refused(f'cannot list folder(s) {names} in {self.root}; '
+                          'fix their permissions so their files are not taken as deleted')
         found = {}
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            rel_dir = os.path.relpath(dirpath, self.root)
-            if rel_dir == '.':
-                dirnames[:] = [d for d in dirnames if d != META_DIR]
-            for name in filenames:
-                rel = name if rel_dir == '.' else f'{rel_dir}/{name}'.replace(os.sep, '/')
-                if self.synced(rel):
-                    with open(os.path.join(dirpath, name), 'rb') as f:
-                        found[rel] = f.read()
+        for rel in sorted(result.entries):
+            for attempt in range(retries + 1):
+                r = self.read_entry(rel)
+                if r.status != 'unstable':
+                    break
+                time.sleep(0.05 * (attempt + 1))
+            if r.status == 'ok':
+                found[rel] = r.data
+            elif r.status == 'unstable':
+                raise Refused(f'{rel} kept changing while being read; wait for the save to finish')
+            elif r.status == 'unreadable':
+                raise Refused(f'cannot read {rel}; fix its permissions')
+            # 'vanished' and 'not_regular': not a file of the sync set any more
         return found
 
     def write_local(self, path, data):
@@ -514,11 +958,7 @@ class Session:
                           f'{self.branch!r}. Run switch, or check out {branch!r} in the Looker IDE.')
 
     def set_mode(self, mode):
-        want = WORKSPACE[mode]
-        self.L.call('PATCH', '/session', body={'workspace_id': want})
-        got = (self.L.call('GET', '/session') or {}).get('workspace_id')
-        if got != want:
-            raise LookerError(f'session workspace is {got!r} after asking for {want!r}')
+        self.L.set_workspace(WORKSPACE[mode])   # remembered: a token refresh sets it again
         self.mode = mode
 
     def current_branch(self):
@@ -541,11 +981,8 @@ class Session:
 
     def remote_files(self):
         """{path: bytes} for every Looker file in the sync set."""
-        files = {}
-        for f in self.file_list():
-            if self.proj.synced(f['path']):
-                files[f['path']] = self.read(f['path'])
-        return files
+        paths = [f['path'] for f in self.file_list() if self.proj.synced(f['path'])]
+        return dict(zip(paths, self.L.read_files(self.project, paths)))
 
     def read(self, path):
         return self.L.call('GET', f'/projects/{self.project}/file/content', {'file_path': path}, raw=True)
@@ -657,6 +1094,538 @@ def record(proj, sess, updates, drops=()):
 
 def in_sync(local, remote):
     return {p: sha(d) for p, d in remote.items() if local.get(p) == d}
+
+
+# ---------------------------------------------------------------- watch core
+#
+# The local half of `watch`: decides WHAT to push and WHEN, never talks to Looker itself.
+# Level-triggered: every tick compares a fresh stat scan (desired state) with the last-known
+# Looker state ({path: sha}), so a lost, merged or late event can never lose a change. One
+# batch slot, never a queue: the scanner keeps ticking while the worker pushes, and after a
+# stall only the latest bytes are pushed. Watch never deletes; a missing file is reported.
+
+GIT_BUSY = ('index.lock', 'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD',
+            'REVERT_HEAD', 'BISECT_LOG')
+
+
+def find_git_dir(root):
+    """The git dir of the clone holding root (following a `.git` file of a worktree), or None.
+    Pure Python: spawns no git."""
+    d = os.path.abspath(root)
+    while True:
+        dot = os.path.join(d, '.git')
+        if os.path.isdir(dot):
+            return dot
+        if os.path.isfile(dot):
+            try:
+                with open(dot) as f:
+                    line = f.readline().strip()
+            except OSError:
+                return None
+            if line.startswith('gitdir:'):
+                return os.path.normpath(os.path.join(d, line[7:].strip()))
+            return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _gate_default():
+    try:
+        from looker_sync import gate
+        return gate.check
+    except Exception:  # noqa: BLE001  gate missing or broken: watch still runs, ungated
+        return lambda path, data: None
+
+
+def _skey(e):
+    return (e.mtime_ns, e.size, e.ino, e.dev)
+
+
+def _under(path, folders):
+    return any(d == '' or path.startswith(d + '/') for d in folders)
+
+
+class _Track:
+    """A path whose stat changed and is waiting to settle."""
+    __slots__ = ('first', 'last', 'settle')
+
+    def __init__(self, now, settle):
+        self.first, self.last, self.settle = now, now, settle
+
+
+class WatchCore:
+    """Scanner plus one-slot worker for `watch`. No network: the caller supplies
+
+    push_one(rel, data)  push one file; return None once Looker acknowledged the write, or a
+                         string to hold the file with that reason (for example "changed in
+                         Looker since last sync") until its local bytes change; raise to
+                         report an error (the file stays pending, retried with backoff)
+    remote_state()       {rel: sha} of Looker's files as last known (state.json by default)
+    on_event(kind, text, paths)
+                         kind: paused | resumed | held | released | pushed | error | notice;
+                         emitted on change only, never repeated every tick
+    gate(rel, data)      None if the bytes may be pushed, else a reason (default: gate.check)
+    hold_check()         None, or a reason to hold every push this tick (branch mismatch...)
+
+    tick() runs one reconcile and is what tests call with a fake clock. start()/stop() run the
+    scanner and the worker in threads. pause(reason)/resume() pause pushing from outside.
+    """
+
+    SETTLE_IN_PLACE = 0.15
+    SETTLE_BURST = 0.5
+    BURST_PATHS = 5
+    REPEAT_WINDOW = 1.0
+    MAX_WAIT = 3.0
+    GIT_QUIET = 0.3
+    CEILING = 200
+
+    def __init__(self, proj, push_one, remote_state=None, on_event=None, gate=None,
+                 hold_check=None, poll=0.05, clock=time.monotonic, wall_ns=time.time_ns,
+                 threaded=True, ceiling=None):
+        self.proj, self.push_one = proj, push_one
+        self.on_event = on_event or (lambda kind, text, paths=(): None)
+        self.gate = gate if gate is not None else _gate_default()
+        self.hold_check = hold_check or (lambda: None)
+        self.poll, self.clock, self.wall_ns, self.threaded = poll, clock, wall_ns, threaded
+        self.ceiling = self.CEILING if ceiling is None else ceiling
+        self.interval, self.scan_duration = poll, 0.0
+        self.lock = threading.RLock()
+        self.synced = dict(remote_state() if remote_state else proj.state.get('files', {}))
+        self.cache = {}         # rel -> (stat key, sha, data or None, read wall ns)
+        self.tracks = {}        # rel -> _Track
+        self.last_change = {}   # rel -> clock of its last stat change
+        self.recheck = set()    # racy mtimes: read again at the next scan
+        self.gone = {}          # rel -> (ino, dev) of a local file seen and then vanished
+        self.held_remote = {}   # rel -> (sha, reason) returned by push_one
+        self.gate_cache = {}    # sha -> reason
+        self.bad = {}           # rel -> read status of a file that cannot be read
+        self._racy_ns = 20_000_000
+        self.last_scan = None
+        self.inflight = None
+        self.external_pause = None
+        self.retry_at, self.backoff = 0.0, 0.0
+        self.git_dir = find_git_dir(proj.root)
+        self.git_head = self._read_head()
+        self.git_busy_until = None
+        self.root_id = self._root_id()
+        self.paused = None
+        self.holds = {}         # key -> (text, paths) currently reported
+        self.last_tick = None
+        self.offset = None      # wall minus monotonic, to spot a clock jump
+        self.stop_event = threading.Event()
+        self.cond = threading.Condition(self.lock)
+        self.threads = []
+
+    # ------------------------------------------------------------ outside controls
+
+    def pause(self, reason):
+        """Stop pushing (scanning goes on) until resume(); emits `paused` once."""
+        with self.lock:
+            self.external_pause = reason
+        self._set_paused(reason)
+
+    def resume(self):
+        """Undo pause(); the next tick emits `resumed`."""
+        with self.lock:
+            self.external_pause = None
+
+    def set_remote(self, rel, sha_value):
+        """Tell the core what Looker now holds for rel (None: absent)."""
+        with self.lock:
+            if sha_value is None:
+                self.synced.pop(rel, None)
+            else:
+                self.synced[rel] = sha_value
+
+    def start(self):
+        self.stop_event.clear()
+        self.threads = [threading.Thread(target=self._scan_loop, daemon=True, name='watch-scan')]
+        if self.threaded:
+            self.threads.append(threading.Thread(target=self._work_loop, daemon=True,
+                                                 name='watch-push'))
+        for t in self.threads:
+            t.start()
+
+    def stop(self, timeout=5):
+        self.stop_event.set()
+        with self.cond:
+            self.cond.notify_all()
+        for t in self.threads:
+            t.join(timeout)
+
+    def _scan_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.tick()
+            except Exception as e:  # noqa: BLE001  a bad tick must not end the watch
+                self.on_event('error', f'scan failed: {e}', ())
+            self.stop_event.wait(self.interval)
+
+    # ------------------------------------------------------------ helpers
+
+    def _emit_hold(self, key, text, paths=()):
+        paths = tuple(sorted(paths))
+        if self.holds.get(key) != (text, paths):
+            self.holds[key] = (text, paths)
+            self.on_event('held', text, paths)
+
+    def _clear_holds(self, keep):
+        for key in [k for k in self.holds if k not in keep]:
+            text, paths = self.holds.pop(key)
+            self.on_event('released', text, paths)
+
+    def _set_paused(self, reason):
+        if self.paused != reason:
+            self.paused = reason
+            self.on_event('paused', reason, ())
+
+    def _root_id(self):
+        try:
+            st = os.stat(self.proj.root)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def _root_ok(self):
+        if self._root_id() != self.root_id or self.root_id is None:
+            return f'the folder {self.proj.root} is gone or was replaced'
+        if not os.path.isfile(self.proj.config_path):
+            return f'{META_DIR}/config.json is missing from {self.proj.root}'
+        return None
+
+    def _read_head(self):
+        if not self.git_dir:
+            return None
+        try:
+            with open(os.path.join(self.git_dir, 'HEAD'), 'rb') as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def _git_busy(self, now):
+        """A reason while git is rewriting the clone, and for GIT_QUIET after it stops."""
+        if not self.git_dir:
+            return None
+        busy = [m for m in GIT_BUSY if os.path.lexists(os.path.join(self.git_dir, m))]
+        head = self._read_head()
+        if head != self.git_head:
+            self.git_head = head
+            busy.append('HEAD moved')
+        if busy:
+            self.git_busy_until = now + self.GIT_QUIET
+            return 'git is busy (' + ', '.join(busy) + ')'
+        if self.git_busy_until is not None and now < self.git_busy_until:
+            return 'git just finished; waiting for it to settle'
+        self.git_busy_until = None
+        return None
+
+    def _settle_for(self, rel, now, atomic, burst):
+        prev = self.last_change.get(rel)
+        if prev is not None and now - prev < self.REPEAT_WINDOW:
+            return min(max(2.5 * (now - prev), 0.5), 3.0)
+        if burst:
+            return self.SETTLE_BURST
+        return 0.0 if atomic else self.SETTLE_IN_PLACE
+
+    def _changed(self, rel, now, atomic, burst):
+        settle = self._settle_for(rel, now, atomic, burst)
+        t = self.tracks.get(rel)
+        if t is None:
+            self.tracks[rel] = _Track(now, settle)
+        else:
+            t.last, t.settle = now, settle
+        self.last_change[rel] = now
+
+    def _store(self, rel, entry, data, read_ns):
+        h = sha(data)
+        with self.lock:
+            keep = data if h != self.synced.get(rel) else None
+        self.cache[rel] = (_skey(entry), h, keep, read_ns)
+        if entry.mtime_ns >= read_ns - self._racy_ns:
+            self.recheck.add(rel)
+
+    # ------------------------------------------------------------ one reconcile
+
+    def tick(self):
+        """Scan, settle, hash, decide; hand one batch to the worker when it is free.
+        Returns the batch handed over this tick ({rel: data}) or None."""
+        now = self.clock()
+        self._watch_clock(now)
+        reason = self._root_ok()
+        if reason:
+            self._set_paused(reason)
+            return None
+        t0 = self.clock()
+        scan = self.proj.scan(previous=self.last_scan)
+        self.scan_duration = self.clock() - t0
+        self.interval = max(self.poll, 9 * self.scan_duration)
+        reason = self._root_ok() or ('the folder cannot be listed' if '' in scan.unreadable
+                                     else None)
+        if reason:
+            self._set_paused(reason)
+            return None
+        prev = self.last_scan.entries if self.last_scan else {}
+        self.last_scan = scan
+        if self.external_pause:
+            self._set_paused(self.external_pause)
+        elif self.paused:
+            self.paused = None
+            self.on_event('resumed', 'watching again', ())
+        self._racy_ns = self._racy_window(scan)
+        self._detect(scan, now, prev)
+        return self._decide(scan, now)
+
+    def _watch_clock(self, now):
+        if self.last_tick is not None and now - self.last_tick > max(2.0, 10 * self.interval):
+            self.on_event('notice', f'no scan for {now - self.last_tick:.1f} s (stalled or '
+                                    'asleep); catching up with the latest state', ())
+        self.last_tick = now
+        offset = self.wall_ns() / 1e9 - now
+        if self.offset is not None and abs(offset - self.offset) > 1.0:
+            self.on_event('notice', f'system clock jumped by {offset - self.offset:+.1f} s', ())
+        self.offset = offset
+
+    @staticmethod
+    def _racy_window(scan):
+        """One mtime tick: 2 s on a filesystem that stores whole seconds (HFS+, FAT, exFAT),
+        else 20 ms (Linux timestamps step in 1 to 4 ms ticks)."""
+        ms = [e.mtime_ns for e in scan.entries.values()]
+        if ms and all(m % 1_000_000_000 == 0 for m in ms[:50]):
+            return 2_000_000_000
+        return 20_000_000
+
+    def _detect(self, scan, now, prev):
+        """Turn stat changes into settle timers; read and hash every file that has settled."""
+        entries, wall = scan.entries, self.wall_ns()
+        changed = []
+        for rel, e in entries.items():
+            p = prev.get(rel)
+            if p is not None and _skey(p) == _skey(e):
+                continue
+            c = self.cache.get(rel)
+            if p is None and c is not None and c[0] == _skey(e):
+                continue                            # carried back from an unreadable folder
+            if p is None and (wall - e.mtime_ns) / 1e9 >= self.MAX_WAIT:
+                self.tracks[rel] = _Track(now, 0.0)  # an old file seen for the first time
+                continue
+            atomic = p is not None and (p.ino, p.dev) != (e.ino, e.dev)
+            changed.append((rel, atomic))
+        burst = len(changed) >= self.BURST_PATHS
+        for rel, atomic in changed:
+            self._changed(rel, now, atomic, burst)
+        # racy mtimes: a same-size write in the same mtime tick is invisible to stat
+        for rel in sorted(self.recheck):
+            self.recheck.discard(rel)
+            e, c = entries.get(rel), self.cache.get(rel)
+            if e is None or c is None or rel in self.tracks or c[0] != _skey(e):
+                continue
+            read_ns = self.wall_ns()
+            r = self.proj.read_entry(rel)
+            if r.status == 'ok' and _skey(r.entry) == c[0] and sha(r.data) == c[1]:
+                if e.mtime_ns >= read_ns - self._racy_ns:
+                    self.recheck.add(rel)
+                continue
+            self._changed(rel, now, False, False)
+        for rel, e in entries.items():
+            if rel not in self.tracks and e.mtime_ns >= scan.started_ns - self._racy_ns:
+                self.recheck.add(rel)
+        # vanished local files: forget them, keep their inode for move detection
+        for rel, p in prev.items():
+            if rel not in entries and not _under(rel, scan.unreadable):
+                self.gone[rel] = (p.ino, p.dev)
+                self.cache.pop(rel, None)
+                self.tracks.pop(rel, None)
+                self.bad.pop(rel, None)
+        for rel in [r for r in self.gone if r in entries]:
+            del self.gone[rel]
+        # settled tracks: one verified read each
+        for rel in sorted(self.tracks):
+            t, e = self.tracks[rel], entries.get(rel)
+            if e is None:
+                del self.tracks[rel]
+                continue
+            forced = now >= t.first + self.MAX_WAIT
+            if now < t.last + t.settle and not forced:
+                continue
+            read_ns = self.wall_ns()
+            r = self.proj.read_entry(rel)
+            if r.status == 'ok' and (_skey(r.entry) == _skey(e) or forced):
+                self._store(rel, r.entry, r.data, read_ns)
+                self.bad.pop(rel, None)
+                del self.tracks[rel]
+            elif r.status in ('ok', 'unstable'):
+                t.last = now                        # still being written: wait again
+            else:
+                del self.tracks[rel]
+                self.cache.pop(rel, None)
+                if r.status != 'vanished':
+                    self.bad[rel] = r.status
+
+    def _decide(self, scan, now):
+        """Desired (disk) versus last-known Looker state: holds, then at most one batch."""
+        entries = scan.entries
+        with self.lock:
+            synced = dict(self.synced)
+            held_remote = dict(self.held_remote)
+            busy = self.inflight is not None
+        keep = set()
+        bad = sorted(f'{r} ({s})' for r, s in self.bad.items() if r in entries)
+        if bad:
+            keep.add('unreadable')
+            self._emit_hold('unreadable', f'{len(bad)} file(s) cannot be read', bad)
+        missing = sorted(p for p in synced if p not in entries
+                         and not _under(p, scan.unreadable))
+        miss_by_sha = {synced[m]: m for m in missing}
+        miss_names = {m.rsplit('/', 1)[-1]: m for m in missing}
+        inode_gone = {self.gone[m]: m for m in missing if m in self.gone}
+        live_sha = {}
+        for rel, c in self.cache.items():
+            if c[1] == synced.get(rel) and rel in entries:
+                live_sha.setdefault(c[1], rel)
+                if c[2] is not None:
+                    self.cache[rel] = (c[0], c[1], None, c[3])   # in Looker: drop the bytes
+        pending, moves, suspects, remote, broken = {}, [], [], [], []
+        for rel in sorted(entries):
+            c = self.cache.get(rel)
+            if c is None or c[1] == synced.get(rel):
+                continue
+            if rel in self.tracks:                  # settling: a broken last read still holds
+                if self.gate_cache.get(c[1]):
+                    broken.append(f'{rel}: {self.gate_cache[c[1]]}')
+                continue
+            hr = held_remote.get(rel)
+            if hr and hr[0] == c[1]:
+                remote.append(f'{rel}: {hr[1]}')
+                continue
+            if rel not in synced:
+                e = entries[rel]
+                src = miss_by_sha.get(c[1]) or inode_gone.get((e.ino, e.dev))
+                if src:
+                    moves.append(f'{src} -> {rel}')
+                    continue
+                if live_sha.get(c[1]) or rel.rsplit('/', 1)[-1] in miss_names:
+                    suspects.append(rel)
+                    continue
+            if c[2] is None:                        # bytes not kept: read again
+                self.tracks[rel] = _Track(now, 0.0)
+                continue
+            pending[rel] = c[2]
+        if remote:
+            keep.add('remote')
+            self._emit_hold('remote', f'{len(remote)} file(s) held by Looker', remote)
+        if moves:
+            keep.add('moves')
+            self._emit_hold('moves', f'{len(moves)} moved file(s) not synced (watch never '
+                            'deletes); run `looker-sync push --delete` to apply the move',
+                            moves)
+        if suspects:
+            keep.add('suspects')
+            self._emit_hold('suspects', f'{len(suspects)} new file(s) look like a copy or a '
+                            'move of another file; edit them or run `looker-sync push`',
+                            suspects)
+        moved_from = set(m.split(' -> ')[0] for m in moves)
+        deleted = [m for m in missing if m not in moved_from]
+        if deleted:
+            keep.add('deleted')
+            self._emit_hold('deleted', f'{len(deleted)} file(s) deleted locally; watch never '
+                            'deletes, run `looker-sync push --delete`', deleted)
+        batch = self._gatekeep(pending, now, keep, broken)
+        self._clear_holds(keep)
+        if batch is None or busy:
+            return None
+        with self.lock:
+            if self.inflight is not None:
+                return None
+            self.inflight = batch
+        if self.threaded:
+            with self.cond:
+                self.cond.notify_all()
+        else:
+            self._push_batch(batch)
+        return batch
+
+    def _gatekeep(self, pending, now, keep, broken=()):
+        """The batch to push now, or None. Every reason to hold applies to the whole batch."""
+        reason = self._git_busy(now)          # every tick, so a moved HEAD is seen at once
+        if reason:
+            keep.add('git')
+            self._emit_hold('git', reason, ())
+            return None
+        if not pending:
+            return None
+        if self.external_pause:
+            return None
+        reason = self.hold_check()
+        if reason:
+            keep.add('external')
+            self._emit_hold('external', reason, ())
+            return None
+        if len(pending) > self.ceiling:
+            keep.add('ceiling')
+            self._emit_hold('ceiling', f'{len(pending)} files changed (more than '
+                            f'{self.ceiling}); run `looker-sync push` to send them', ())
+            return None
+        bad = list(broken)
+        for rel, data in pending.items():
+            h = sha(data)
+            if h not in self.gate_cache:
+                try:
+                    self.gate_cache[h] = self.gate(rel, data)
+                except Exception as e:  # noqa: BLE001  a crashing gate holds, never passes
+                    self.gate_cache[h] = f'syntax check failed: {e}'
+            if self.gate_cache[h]:
+                bad.append(f'{rel}: {self.gate_cache[h]}')
+        if bad:
+            keep.add('gate')
+            self._emit_hold('gate', f'syntax error; holding all {len(pending)} pending '
+                            'file(s) until it is fixed', bad)
+            return None
+        if now < self.retry_at:
+            return None
+        return dict(pending)
+
+    # ------------------------------------------------------------ worker
+
+    def _work_loop(self):
+        while True:
+            with self.cond:
+                while self.inflight is None and not self.stop_event.is_set():
+                    self.cond.wait(0.5)
+                if self.stop_event.is_set():
+                    return
+                batch = self.inflight
+            self._push_batch(batch)
+
+    def _push_batch(self, batch):
+        """New files first (an include may need them), then changed ones, in path order."""
+        try:
+            with self.lock:
+                order = sorted(batch, key=lambda p: (p in self.synced, p))
+            for rel in order:
+                data = batch[rel]
+                try:
+                    result = self.push_one(rel, data)
+                except Exception as e:  # noqa: BLE001
+                    with self.lock:
+                        self.backoff = min(max(self.backoff * 2, 1.0), 30.0)
+                        self.retry_at = self.clock() + self.backoff
+                    self.on_event('error', f'{rel}: {e}; retrying in {self.backoff:.0f} s',
+                                  (rel,))
+                    return
+                with self.lock:
+                    if isinstance(result, str):
+                        self.held_remote[rel] = (sha(data), result)
+                    else:
+                        self.synced[rel] = sha(data)
+                        self.held_remote.pop(rel, None)
+                        self.backoff = 0.0
+                if not isinstance(result, str):
+                    self.on_event('pushed', rel, (rel,))
+        finally:
+            with self.lock:
+                self.inflight = None
 
 
 # ---------------------------------------------------------------- commands

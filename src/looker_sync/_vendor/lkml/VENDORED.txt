@@ -1,0 +1,19 @@
+lkml: a pure-Python LookML parser by Josh Temple, vendored so looker-sync keeps no runtime
+dependencies. License: MIT, see LICENSE.md in this folder (copied unchanged from the sdist).
+
+version:  1.3.7
+project:  https://github.com/joshtemple/lkml
+source:   https://files.pythonhosted.org/packages/bf/18/18a3d0281c5e209156b877796096d4ac7259f03465409673056386c99221/lkml-1.3.7.tar.gz
+sha256:   51dc9f1b7e74cd7a00e0dbbf06fb573952015328f1f4a3a0730d444444a8ae7a
+
+Kept from the sdist's lkml/ folder: __init__.py, keys.py, lexer.py, parser.py, simple.py,
+tokens.py, tree.py, utils.py, visitors.py.
+Dropped: __main__.py, py.typed, tests/, packaging files.
+
+Local changes:
+- Imports rewritten from `lkml.x` to relative imports, so the package loads as
+  `looker_sync._vendor.lkml`.
+- __init__.py: the command-line entry point (parse_args, cli) and its imports removed;
+  parse, load and dump are unchanged.
+- lexer.py: a lone `;` at the start of a token now raises SyntaxError. Upstream loops
+  forever on it (for example `type: string ;`).
