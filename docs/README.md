@@ -35,6 +35,7 @@ Simply true, and expensive to re-derive.
 | page | summary | verified |
 |---|---|---|
 | [Looker file and branch API behaviour (live-verified)](reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-10-24 |
+| [Looker HTTP behaviour behind watch and fast push](reference/looker-http-behaviour.md) | Latency, keep-alive, token life and retry rules for the Looker API, with each fact marked as seen live or only in code and tests | 2026-11-08 |
 
 ## Decisions
 
@@ -44,5 +45,6 @@ it with a new one rather than editing it.
 - [The tool writes files and never touches git state](adr/0001-read-and-write-files-only.md)
 - [No commit command; ship on PyPI with the skill inside](adr/0002-no-commit-command-and-uvx-distribution.md)
 - [Never touch Looker's git state; touch a linked clone only through a narrow, checked scope](adr/0003-never-touch-lookers-git-and-a-narrow-local-git-scope.md)
+- [Hold a file changed in Looker; never overwrite it without --force](adr/0004-hold-a-file-changed-in-looker.md)
 
 <!-- END GENERATED INDEX -->

@@ -115,3 +115,32 @@ Looker's commit now refuses with "is in this clone but on no branch of remote" a
 - **Measured live** (Linux, sandbox, median of 5): a push with no change went from 8.2 s to
   2.9 s, a push of one changed file from 10.2 s to 5.3 s. Session setup is now most of a
   no-change push.
+
+## Watch (verified 2026-11-08)
+
+`cmd_watch` refuses in prod mode, on a read-only branch and on git drift. `WatchCore` is the
+scanner and a one-slot worker, with no network. `WatchNet` adds the Looker side.
+
+- **Reconcile, not events.** Each scan (default every 50 ms) compares file stats with the last
+  scan and derives the pending work from disk versus the hashes last synced. There is no queue,
+  so after a stall only the latest content is pushed.
+- **Settle.** 150 ms for an in-place save; none for an atomic rename; 0.5 s in a burst (5 or more
+  paths at once, or a repeat within 1 s); 3 s at most, so a noisy file cannot starve the others.
+- **Order for one file.** The conflict read starts when the change is first seen. Then the syntax
+  gate (`gate.check`), then `WatchNet.push_one`, which prints `ack` once Looker accepts the
+  write. A separate thread reads the file back and prints `verified` or `MISMATCH`; only a
+  verified file is recorded in `state.json`.
+- **Holds apply to the whole batch** for a syntax error (`_gatekeep`), a git operation in
+  progress (`GIT_BUSY`, or HEAD moving), an unconfirmed branch (30 s), and more than 200 changed
+  files. One-shot `push` runs no syntax gate, so it is the way past a false hold.
+- **Holds apply per file** for a change in Looker (see
+  [ADR 0004](../adr/0004-hold-a-file-changed-in-looker.md)), a move, a likely copy, a file still
+  being written after the 3 s limit, and a file that cannot be read.
+- **Never deletes.** A local delete or a move is reported and left for `push --delete`.
+- **Pauses, never exits.** Reasons: Looker's branch or mode changed, read-only branch, refused
+  session, project folder gone. A background check runs every 5 s (`WatchNet.branch_tick`). If it
+  finds another branch after writes since the last check, an `error` line says those writes may
+  have landed there.
+- **Not tested live:** a real branch switch in the Looker IDE. The live check changed the name
+  the watcher expects and left Looker's branch alone; the fake Looker covers its own branch
+  changing (`WatchNetBranchTest`).

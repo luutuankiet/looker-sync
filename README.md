@@ -37,7 +37,8 @@ and never written anywhere else.
 | `link [--remote NAME]` | link an existing folder to a git remote of its clone (default `origin`), so git and Looker stay on the same branch |
 | `pull [--force] [--dry-run]` | copy Looker files to disk; never deletes local files |
 | `status` | show what differs on each side, and how far the dev branch is ahead of and behind its remote; writes nothing |
-| `push [--force] [--delete] [--dry-run]` | write local changes, read every file back, then validate |
+| `push [--force] [--delete] [--dry-run] [--no-validate] [--verbose]` | write local changes, read each written file back, then validate. It reads from Looker only the files it will write or delete. `--no-validate` skips validation (the read-back still runs). `--verbose` times each step on stderr and shows info-severity validation lines, which are otherwise hidden and counted |
+| `watch [--validate] [--verbose] [--poll MS] [--force]` | push every save as it happens, until Ctrl-C. See below |
 | `switch (--branch B \| --mode dev\|prod) [--force]` | move Looker and the folder to another branch or mode. `--force` = back up local changes and confirm. In a linked folder it also stashes a dirty tree, checks out B in git and fast-forwards it to Looker's commit; it never pops the stash |
 | `skill [--path]` | print the full usage guide written for agents |
 
@@ -45,6 +46,46 @@ Global options: `-C <project folder>` (default: the current folder) and `--env-f
 `--help` is the short reference; `looker-sync skill` is the long one.
 
 Exit codes: 0 ok, 1 Looker or network error, 2 refused by a guard, 3 validation errors.
+
+## Watch
+
+`looker-sync watch` watches the folder and writes each save to your dev workspace, usually in
+under a second. It runs until Ctrl-C.
+
+| flag | what it does |
+|---|---|
+| `--validate` | validate in Looker after writes go quiet (2 s). Off by default |
+| `--verbose` | show info-severity validation lines |
+| `--poll MS` | scan interval in ms, default 50, at least 10 |
+| `--force` | overwrite files changed in Looker since the last sync |
+
+Each event is one line: time, kind, then the file or the reason.
+
+| line | meaning |
+|---|---|
+| `ack` | Looker accepted the write |
+| `verified` | the read-back matched the bytes sent, and the file is recorded as synced |
+| `MISMATCH` | Looker holds different bytes than were sent; check it in the Looker IDE |
+| `held` | not written, with the reason; the watch carries on |
+| `released` | an earlier hold no longer applies |
+| `paused` / `resumed` | nothing is written until the reason clears (another branch in Looker, session refused, project folder gone) |
+| `notice` / `error` | information, or a failure that is being retried |
+
+- **A syntax error holds everything.** One `.lkml` file that does not parse holds every pending
+  file until it is fixed; the line names the file and the reason. `.dashboard.lookml` files are
+  not checked. One-shot `push` runs no syntax check, so it is the way past a hold you disagree
+  with.
+- **A file changed in Looker is held,** never overwritten, unless you pass `--force`. Run `pull`
+  to take Looker's copy. A file deleted in Looker is held the same way.
+- **It never deletes.** A local delete or a moved file is reported and left for
+  `push --delete`. A new file that looks like a copy of another is held too.
+- **Other holds:** a git operation in progress, a file still being written after 3 s, and more
+  than 200 changed files at once (run `push` for those).
+- **Branch checks run every 5 s, in the background.** A branch switched in the Looker IDE between
+  two checks can take a write; the next check prints an `error` line and pauses.
+
+`watch` exits 0 on Ctrl-C, 2 if refused at start (prod mode, read-only branch, wrong branch) and
+1 if Looker cannot be reached at start. Errors after that pause or retry; they do not exit.
 
 ## What it guarantees
 

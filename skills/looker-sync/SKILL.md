@@ -1,6 +1,6 @@
 ---
 name: looker-sync
-description: Move LookML between a local folder and your own Looker dev workspace with the looker-sync CLI (pull, status, push with byte-for-byte read-back and validation, switch). Use before editing any LookML that must reach Looker, before validating a Looker project, when mounting a Looker project into a new folder, and when Looker and the local files might disagree.
+description: Move LookML between a local folder and your own Looker dev workspace with the looker-sync CLI (pull, status, push with byte-for-byte read-back and validation, switch, watch for continuous sync). Use before editing any LookML that must reach Looker, before validating a Looker project, when mounting a Looker project into a new folder, and when Looker and the local files might disagree.
 ---
 
 # looker-sync
@@ -129,6 +129,63 @@ Looker branch together. Unlinked folders behave as above and never run git.
 - **Never:** commit, push, pull, reset, rebase, `git clean` or `stash pop`. Allowed: reads,
   `fetch`, `stash push`, `checkout` and `merge --ff-only`. Commit and pull with git yourself;
   pull Looker from its remote in the Looker IDE.
+
+## Fast push flags
+
+`push` reads from Looker only the files it will write or delete, so a file changed only in
+Looker no longer refuses a push that leaves it alone; `status` and `pull` still report it. In a
+linked folder `push` and `watch` run `git fetch` only when Looker's commit is not already on a
+branch of the remote as last fetched.
+
+- `push --no-validate` skips validation and prints `validation: skipped (--no-validate)`. The
+  read-back still runs.
+- `push --verbose` prints `timing: <phase> <seconds>` lines on stderr and shows info-severity
+  validation lines. Without it they are hidden and counted:
+  `(N info line(s) hidden; --verbose shows them)`.
+
+## Watch: continuous sync
+
+```
+uvx looker-sync watch [--validate] [--verbose] [--poll MS] [--force]
+```
+
+Writes each save to the dev workspace, usually in under a second, until Ctrl-C. Validation is
+off unless `--validate`, which runs it after 2 s without a write. `--poll` is the scan interval
+in ms (default 50, at least 10). `--force` overwrites files changed in Looker; it needs a stated
+reason, like `push --force`.
+
+Read the output. One line per event: time, kind, then the file or the reason.
+
+| kind | meaning | what to do |
+|---|---|---|
+| `ack` | Looker accepted the write | carry on |
+| `verified` | read-back matched, recorded as synced | carry on |
+| `MISMATCH` | Looker holds different bytes than were sent | check it in the Looker IDE, then `pull` or `push --force` |
+| `held` | not written; the line gives the reason | read the reason, see below |
+| `released` | an earlier hold no longer applies | carry on |
+| `paused` / `resumed` | nothing is written until the reason clears | read the reason; a branch change is for the user |
+| `notice` / `error` | information, or a failure being retried | read it |
+
+- **`ack` is not proof.** Wait for `verified` before you rely on the bytes being in Looker.
+- **Syntax gate.** One `.lkml` file that does not parse holds every pending file, and the line
+  names the file and the reason. Fix it and they all go. `.dashboard.lookml` files are not
+  checked. **One-shot `push` runs no syntax gate**, so it is the escape hatch for a hold you are
+  sure is wrong; Looker validation still runs after it.
+- **Changed in Looker.** The file is held, not overwritten, and other files carry on. It is
+  held again each time the local bytes change while Looker's copy still differs. `pull` takes
+  Looker's copy if you have not touched the file; otherwise report it.
+- **Never deletes.** Local deletes and moves are reported and left for `push --delete`, which
+  needs a stated reason. A new file that looks like a copy of another is held until edited or
+  pushed.
+- **Holds with no action needed:** a git operation in progress, and a file still being written.
+  More than 200 changed files at once are held for a one-shot `push`.
+- **Branch.** Checked every 5 s in the background, and every write is held if the branch has not
+  been confirmed for 30 s. A branch switched in the IDE between two checks can take a write: the
+  next check prints an `error` line saying writes may have landed there, and pauses. Stop and
+  tell the user. Only `switch` moves branches.
+- **Exit codes.** 0 on Ctrl-C, 2 if refused at start, 1 if Looker cannot be reached at start.
+  After that, errors pause or retry; the process does not exit, so a script cannot rely on the
+  exit code to see a problem. Read the lines.
 
 ## Committing
 
