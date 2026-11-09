@@ -146,13 +146,14 @@ branch of the remote as last fetched.
 ## Watch: continuous sync
 
 ```
-uvx looker-sync watch [--validate] [--verbose] [--poll MS] [--force]
+uvx looker-sync watch [--validate] [--verbose] [--poll MS] [--force] [--no-delete]
 ```
 
-Writes each save to the dev workspace, usually in under a second, until Ctrl-C. Validation is
-off unless `--validate`, which runs it after 2 s without a write. `--poll` is the scan interval
-in ms (default 50, at least 10). `--force` overwrites files changed in Looker; it needs a stated
-reason, like `push --force`.
+Writes each save to the dev workspace, usually in under a second, and mirrors local deletes and
+renames, until Ctrl-C. Validation is off unless `--validate`, which runs it after 2 s without a
+write. `--poll` is the scan interval in ms (default 50, at least 10). `--force` overwrites or
+deletes files changed in Looker; it needs a stated reason, like `push --force`. `--no-delete`
+only reports local deletes and renames.
 
 Read the output. One line per event: time, kind, then the file or the reason.
 
@@ -161,7 +162,8 @@ Read the output. One line per event: time, kind, then the file or the reason.
 | `ack` | Looker accepted the write | carry on |
 | `verified` | read-back matched, recorded as synced | carry on |
 | `MISMATCH` | Looker holds different bytes than were sent | check it in the Looker IDE, then `pull` or `push --force` |
-| `held` | not written; the line gives the reason | read the reason, see below |
+| `deleted` | Looker no longer holds this file or folder | carry on, unless you did not mean to delete it |
+| `held` | not written or deleted; the line gives the reason | read the reason, see below |
 | `released` | an earlier hold no longer applies | carry on |
 | `paused` / `resumed` | nothing is written until the reason clears | read the reason; a branch change is for the user |
 | `notice` / `error` | information, or a failure being retried | read it |
@@ -174,9 +176,25 @@ Read the output. One line per event: time, kind, then the file or the reason.
 - **Changed in Looker.** The file is held, not overwritten, and other files carry on. It is
   held again each time the local bytes change while Looker's copy still differs. `pull` takes
   Looker's copy if you have not touched the file; otherwise report it.
-- **Never deletes.** Local deletes and moves are reported and left for `push --delete`, which
-  needs a stated reason. A new file that looks like a copy of another is held until edited or
-  pushed.
+- **Deletes by default.** A synced file deleted locally while `watch` runs is deleted in Looker
+  after 1.5 s, with a `deleted` line. A rename or move writes and verifies the new path, then
+  deletes the old one; a failed write leaves both. Copies are written like any new file. So
+  **do not `rm` a file in the watched folder unless you mean to delete it in Looker.** Uncommitted
+  work there has no history. Files that exist only in Looker, and files already missing at start,
+  are never touched; use `push --delete` for those, which needs a stated reason.
+- **Folders.** A folder that vanishes locally is removed in Looker once its synced files are gone,
+  topmost folder only, with a `deleted` line ending `(folder)`. Looker's folder delete is
+  recursive, so a listing just before the call must show no file under it. Otherwise the folder
+  is left and reported once in a `notice`, and not retried unless it reappears locally.
+- **Holds apply to deletes too:** prod mode, paused or wrong branch, project folder gone, an
+  unreadable folder, a git operation, the syntax gate, and the 200 file ceiling (writes plus
+  deletes). A file changed in Looker is held, not deleted, unless `--force`.
+- **Git.** A path that vanishes during a git operation, or within 1.5 s of a ref move, is never
+  deleted; a `held` line points at `push --delete`. **`git clean` takes no lock and moves no ref,
+  so it looks like `rm` and WILL delete.** Stop `watch` before running it.
+- **`--no-delete`** is the older behaviour: local deletes and moves are reported and left for
+  `push --delete`, a new file that looks like a copy of another is held until edited or pushed,
+  and no file or folder is deleted.
 - **Holds with no action needed:** a git operation in progress, and a file still being written.
   More than 200 changed files at once are held for a one-shot `push`.
 - **Branch.** Checked every 5 s in the background, and every write is held if the branch has not

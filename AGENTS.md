@@ -10,7 +10,10 @@ or push endpoint, so agents cannot commit). Published to PyPI: `uvx looker-sync`
 
 - **Standard library only.** No runtime dependencies.
 - **Never write in prod mode, never delete without `--delete`, never send `ref` to the
-  branch endpoint** (it hard-resets and force-pushes).
+  branch endpoint** (it hard-resets and force-pushes). One narrow exception to the delete rule:
+  `watch` deletes by default what you delete locally during the run, including folders that
+  vanish with their files. Everything else still needs `--delete`, and `watch --no-delete` turns
+  the exception off. See [ADR 0005](docs/adr/0005-watch-deletes-by-default.md).
 - **Credentials come only from the env file** (`LOOKER_URL`, `LOOKER_CLIENT_ID`,
   `LOOKER_CLIENT_SECRET`). Never print them and never commit one.
 - **Test against a sandbox Looker project**, never a project someone depends on.

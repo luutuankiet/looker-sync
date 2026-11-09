@@ -27,7 +27,7 @@ Simply true, and expensive to re-derive.
 
 | page | summary | verified |
 |---|---|---|
-| [Looker file and branch API behaviour (live-verified)](../../../docs/reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-10-24 |
+| [Looker file and branch API behaviour (live-verified)](../../../docs/reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-11-09 |
 | [Looker HTTP behaviour behind watch and fast push](../../../docs/reference/looker-http-behaviour.md) | Latency, keep-alive, token life and retry rules for the Looker API, with each fact marked as seen live or only in code and tests | 2026-11-08 |
 
 ## Decisions
@@ -39,6 +39,7 @@ it with a new one rather than editing it.
 - [No commit command; ship on PyPI with the skill inside](../../../docs/adr/0002-no-commit-command-and-uvx-distribution.md)
 - [Never touch Looker's git state; touch a linked clone only through a narrow, checked scope](../../../docs/adr/0003-never-touch-lookers-git-and-a-narrow-local-git-scope.md)
 - [Hold a file changed in Looker; never overwrite it without --force](../../../docs/adr/0004-hold-a-file-changed-in-looker.md)
+- [Watch deletes by default what you delete locally during the run](../../../docs/adr/0005-watch-deletes-by-default.md)
 
 <!-- END GENERATED INDEX -->
 

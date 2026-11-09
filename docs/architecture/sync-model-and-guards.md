@@ -1,7 +1,7 @@
 ---
 title: Sync model and guards
 covers: how pull, push, status and switch decide what to write, which guard refuses what, and where in looker_sync.py each lives
-verified: 2026-11-08
+verified: 2026-11-09
 ---
 
 # Sync model and guards
@@ -137,6 +137,7 @@ scanner and a one-slot worker, with no network. `WatchNet` adds the Looker side.
   [ADR 0004](../adr/0004-hold-a-file-changed-in-looker.md)), a move, a likely copy, a file still
   being written after the 3 s limit, and a file that cannot be read.
 - **Never deletes.** A local delete or a move is reported and left for `push --delete`.
+  (Superseded 2026-11-09: true now only with `--no-delete`. See "Watch deletes by default" below.)
 - **Pauses, never exits.** Reasons: Looker's branch or mode changed, read-only branch, refused
   session, project folder gone. A background check runs every 5 s (`WatchNet.branch_tick`). If it
   finds another branch after writes since the last check, an `error` line says those writes may
@@ -144,3 +145,38 @@ scanner and a one-slot worker, with no network. `WatchNet` adds the Looker side.
 - **Not tested live:** a real branch switch in the Looker IDE. The live check changed the name
   the watcher expects and left Looker's branch alone; the fake Looker covers its own branch
   changing (`WatchNetBranchTest`).
+
+## Watch deletes by default (verified 2026-11-09)
+
+This supersedes the "Never deletes" line in the Watch section above and the "likely copy" and
+"move" per-file holds, all of which now apply only with `watch --no-delete`. The reasons, and the
+risks that remain, are in [ADR 0005](../adr/0005-watch-deletes-by-default.md).
+
+- **Files (`WatchCore._plan_deletes`, `WatchNet.delete_one`).** A path is deleted only when this
+  run saw it vanish (`gone`), git was quiet, it has stayed absent for `DELETE_GRACE` (1.5 s) and a
+  fresh `lstat` agrees. `delete_one` reads Looker's copy first: a file changed in Looker is held
+  unless `--force`, and one Looker already lost is dropped from state. After the delete it reads
+  the path again, and only then prints `deleted`. Files only in Looker are never candidates. A
+  file already missing when `watch` started gets a notice.
+- **Moves.** A rename or move, of one file or a whole nested folder, writes the new path first.
+  The old path is deleted only once the new one is proved in Looker with the same hash, so a
+  failed write leaves both. Copies, and new files sharing a base name, are written normally.
+- **Folders (`WatchCore._plan_folders`, `WatchNet.delete_folder`).** Looker's folder delete is
+  recursive; see [looker-file-api-behaviour](../reference/looker-file-api-behaviour.md). A folder
+  qualifies when a synced file under it vanished this run, it has stayed absent for the grace
+  period with git quiet, and no synced file remains under it. Only the topmost qualifying folder
+  is sent. Each local guard is checked again just before the call (`_delete_folder`), and a file
+  listing taken just before the delete must show no file under the folder. Otherwise the folder
+  goes into `dir_left`, is reported once, and is not retried unless it reappears locally.
+- **Batches (`_push_batch`).** Writes and deletes of one batch run in parallel, at most
+  `BATCH_WORKERS` (8) at a time, in the order new files, changed files, deletes, folders.
+- **Holds (`_gatekeep`).** The whole-batch holds now count deletes: prod mode, paused or wrong
+  branch, project folder gone, an unreadable folder, git busy, the syntax gate, and the 200 file
+  ceiling, which counts writes plus deletes and folders. A tick with only deletes cannot slip past
+  them.
+- **Git.** A path that vanishes during git activity, or within `DELETE_GRACE` of a ref move, goes
+  into `git_gone` and is never deleted; a `held` line points at `push --delete`. A `git init` after
+  `watch` starts is picked up. `git clean` takes no lock and moves no ref, so it looks like `rm`
+  and will delete.
+- **`--no-delete`** leaves `delete_one` and `delete_folder` unset, so the older holds apply and no
+  file or folder is deleted.

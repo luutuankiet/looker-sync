@@ -38,7 +38,7 @@ and never written anywhere else.
 | `pull [--force] [--dry-run]` | copy Looker files to disk; never deletes local files |
 | `status` | show what differs on each side, and how far the dev branch is ahead of and behind its remote; writes nothing |
 | `push [--force] [--delete] [--dry-run] [--no-validate] [--verbose]` | write local changes, read each written file back, then validate. It reads from Looker only the files it will write or delete. `--no-validate` skips validation (the read-back still runs). `--verbose` times each step on stderr and shows info-severity validation lines, which are otherwise hidden and counted |
-| `watch [--validate] [--verbose] [--poll MS] [--force]` | push every save as it happens, until Ctrl-C. See below |
+| `watch [--validate] [--verbose] [--poll MS] [--force] [--no-delete]` | push every save, delete and rename as it happens, until Ctrl-C. See below |
 | `switch (--branch B \| --mode dev\|prod) [--force]` | move Looker and the folder to another branch or mode. `--force` = back up local changes and confirm. In a linked folder it also stashes a dirty tree, checks out B in git and fast-forwards it to Looker's commit; it never pops the stash |
 | `skill [--path]` | print the full usage guide written for agents |
 
@@ -57,7 +57,8 @@ under a second. It runs until Ctrl-C.
 | `--validate` | validate in Looker after writes go quiet (2 s). Off by default |
 | `--verbose` | show info-severity validation lines |
 | `--poll MS` | scan interval in ms, default 50, at least 10 |
-| `--force` | overwrite files changed in Looker since the last sync |
+| `--force` | overwrite or delete files changed in Looker since the last sync |
+| `--no-delete` | report local deletes and renames instead of applying them |
 
 Each event is one line: time, kind, then the file or the reason.
 
@@ -66,7 +67,8 @@ Each event is one line: time, kind, then the file or the reason.
 | `ack` | Looker accepted the write |
 | `verified` | the read-back matched the bytes sent, and the file is recorded as synced |
 | `MISMATCH` | Looker holds different bytes than were sent; check it in the Looker IDE |
-| `held` | not written, with the reason; the watch carries on |
+| `deleted` | Looker no longer holds this file or folder, confirmed by reading it back |
+| `held` | not written or deleted, with the reason; the watch carries on |
 | `released` | an earlier hold no longer applies |
 | `paused` / `resumed` | nothing is written until the reason clears (another branch in Looker, session refused, project folder gone) |
 | `notice` / `error` | information, or a failure that is being retried |
@@ -77,8 +79,21 @@ Each event is one line: time, kind, then the file or the reason.
   with.
 - **A file changed in Looker is held,** never overwritten, unless you pass `--force`. Run `pull`
   to take Looker's copy. A file deleted in Looker is held the same way.
-- **It never deletes.** A local delete or a moved file is reported and left for
-  `push --delete`. A new file that looks like a copy of another is held too.
+- **It deletes what you delete, by default.** A synced file you delete locally while `watch` runs
+  is deleted in Looker after 1.5 s, with a `deleted` line. A rename or move writes and verifies
+  the new path, then deletes the old one; a failed write leaves both. Copies are written like any
+  new file. Files that exist only in Looker, and files already missing when `watch` started, are
+  left alone (`push --delete` handles those). A file changed in Looker is held unless `--force`.
+- **Folders follow.** A folder that vanishes locally is removed in Looker once its synced files
+  are gone, topmost folder only. Looker's folder delete is recursive, so if a listing just before
+  the call shows any file still under it, the folder is left and reported once.
+- **A mistaken `rm` reaches Looker.** Uncommitted work in your dev workspace has no history to
+  recover it from. **`git clean` looks like `rm` and will delete too**: stop `watch` first.
+  A git checkout, pull or rebase never deletes; those paths get a notice pointing at
+  `push --delete`.
+- **`--no-delete` is the older behaviour.** Deletes and moves are only reported and left for
+  `push --delete`, and a new file that looks like a copy of another is held. No file or folder is
+  deleted.
 - **Other holds:** a git operation in progress, a file still being written after 3 s, and more
   than 200 changed files at once (run `push` for those).
 - **Branch checks run every 5 s, in the background.** A branch switched in the Looker IDE between
@@ -93,7 +108,8 @@ Each event is one line: time, kind, then the file or the reason.
   validation and prints `file:line  message`.
 - It refuses to overwrite a file edited in Looker since your last sync (`--force` to override).
 - `pull` never deletes local files and refuses to overwrite unpushed local work.
-- `push` never deletes files in Looker without `--delete`, and never writes in prod mode.
+- `push` never deletes files in Looker without `--delete`, and never writes in prod mode. `watch`
+  deletes by default only what you delete locally during the run; see Watch above.
 - A push that stops partway records what it wrote; the next push retries only the rest.
 
 ## What it does not do

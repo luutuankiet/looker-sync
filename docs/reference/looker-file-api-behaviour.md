@@ -1,7 +1,7 @@
 ---
 title: Looker file and branch API behaviour (live-verified)
 summary: How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance
-verified: 2026-10-24
+verified: 2026-11-09
 ---
 
 # Looker file and branch API behaviour
@@ -16,7 +16,7 @@ the fake first.
 | `POST /projects/{p}/directories` `{"path": "a/b"}` | 200, and it creates `a` too |
 | the same call for a folder that already exists | 400 `Directory already exists` (harmless) |
 | `GET /projects/{p}/files` | lists files only; an empty folder never appears |
-| `DELETE /projects/{p}/directories` | 400 with a Ruby `delete_prefix` error; an empty folder created by the API can only be removed in the IDE |
+| `DELETE /projects/{p}/directories` | 400 with a Ruby `delete_prefix` error; an empty folder created by the API can only be removed in the IDE. **Superseded 2026-11-09:** with the `path` query parameter it answers 200 and is recursive; see "Folder delete is recursive" below |
 | `PUT /projects/{p}/git_branch` from a second API token of the same user | moves the branch for every token and the browser IDE |
 
 The last row is the reason `looker_sync.py` aborts on a branch mismatch: the checked-out
@@ -107,3 +107,20 @@ one means writing to production. So `readonly` on a colleague's personal branch,
 refusing it, still rest on the field the branch resource reports. A new user on this instance
 also could not get API3 credentials (`POST /users/{id}/credentials_api3` answered 404); admin
 sudo (`POST /login/{user_id}`) worked.
+
+## Folder delete is recursive (verified 2026-11-09)
+
+`DELETE /projects/{p}/directories?path=<folder>` answers 200 with body `{}`, and it is
+**recursive**: it removes the files in the folder with no warning and no error. Seen on a real
+instance, sandbox project, dev mode. Each call took 321 to 402 ms.
+
+| case | n | status | body | result |
+|---|---|---|---|---|
+| folder holding a file (once with the file in a subfolder) | 3 | 200 | `{}` | file and folder both gone; the file's content then answers 404 |
+| empty folder | 3 | 200 | `{}` | gone from the folder listing |
+| parent whose only children are empty folders | 3 | 200 | `{}` | parent and all children gone |
+
+The API has no conditional form of this call. A client that needs "only if empty" must list the
+files first, and a file created between that listing and the delete is destroyed. The older row
+in the table at the top of this page, which says 400, is what an earlier check saw; the `path`
+query parameter is what was sent here.

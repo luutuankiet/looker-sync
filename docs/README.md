@@ -15,7 +15,7 @@ something is implemented.
 
 | page | covers | verified |
 |---|---|---|
-| [Sync model and guards](architecture/sync-model-and-guards.md) | how pull, push, status and switch decide what to write, which guard refuses what, and where in looker_sync.py each lives | 2026-11-08 |
+| [Sync model and guards](architecture/sync-model-and-guards.md) | how pull, push, status and switch decide what to write, which guard refuses what, and where in looker_sync.py each lives | 2026-11-09 |
 
 ## Traps
 
@@ -34,7 +34,7 @@ Simply true, and expensive to re-derive.
 
 | page | summary | verified |
 |---|---|---|
-| [Looker file and branch API behaviour (live-verified)](reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-10-24 |
+| [Looker file and branch API behaviour (live-verified)](reference/looker-file-api-behaviour.md) | How the Looker API answers for new folders, directories and the shared dev checkout, as seen on a live instance | 2026-11-09 |
 | [Looker HTTP behaviour behind watch and fast push](reference/looker-http-behaviour.md) | Latency, keep-alive, token life and retry rules for the Looker API, with each fact marked as seen live or only in code and tests | 2026-11-08 |
 
 ## Decisions
@@ -46,5 +46,6 @@ it with a new one rather than editing it.
 - [No commit command; ship on PyPI with the skill inside](adr/0002-no-commit-command-and-uvx-distribution.md)
 - [Never touch Looker's git state; touch a linked clone only through a narrow, checked scope](adr/0003-never-touch-lookers-git-and-a-narrow-local-git-scope.md)
 - [Hold a file changed in Looker; never overwrite it without --force](adr/0004-hold-a-file-changed-in-looker.md)
+- [Watch deletes by default what you delete locally during the run](adr/0005-watch-deletes-by-default.md)
 
 <!-- END GENERATED INDEX -->
