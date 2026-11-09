@@ -484,6 +484,19 @@ class CLITest(FakeLookerTestCase):
             self.assertIn(SECRET, f.read())   # a filled .env is never overwritten
         self.assertEqual(run('init', '--project', PROJECT).returncode, 2)  # already set up
 
+    def test_init_defaults_add_js_md_strings_and_skip_node_modules(self):
+        self.init()
+        with open(os.path.join(self.dir, '.looker-sync', 'config.json')) as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg['include'], ['**/*.lkml', '**/*.dashboard.lookml', '**/*.js',
+                                          '**/*.md', '**/*.strings.json'])
+        self.assertEqual(cfg['exclude'], ['**/node_modules/**'])
+        proj = _import_cli().Project(self.dir)
+        for path in ('vis/a.js', 'README.md', 'docs/x.md', 'en.strings.json', 'views/v.view.lkml'):
+            self.assertTrue(proj.synced(path), path)
+        for path in ('node_modules/x/a.js', 'vis/node_modules/y/b.js', 'data.json', 'main.go'):
+            self.assertFalse(proj.synced(path), path)
+
     def test_init_on_a_terminal_asks_for_project_and_pull(self):
         master, slave = pty.openpty()
         p = subprocess.Popen([sys.executable, CLI, '-C', self.dir, 'init', '--branch', 'feat'],
@@ -606,7 +619,8 @@ class CLITest(FakeLookerTestCase):
 
     def test_env_and_non_lookml_files_are_never_sent(self):
         self.init()
-        self.put_local('notes.md', '# notes\n')
+        self.put_local('notes.txt', 'notes\n')
+        self.put_local('node_modules/x/a.js', 'x')
         self.put_local('.claude/skill.lkml.bak', 'x')
         self.put_local('views/orders.view.lkml', 'view: orders { # edit\n}\n')
         self.run_cli('push')

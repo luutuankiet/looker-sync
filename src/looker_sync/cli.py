@@ -57,6 +57,9 @@ import threading
 
 META_DIR = '.looker-sync'
 DEFAULT_INCLUDE = ['**/*.lkml', '**/*.dashboard.lookml']
+# What a fresh init writes. Looker's file API accepted these types (live check, 2026-11-09).
+INIT_INCLUDE = DEFAULT_INCLUDE + ['**/*.js', '**/*.md', '**/*.strings.json']
+INIT_EXCLUDE = ['**/node_modules/**']
 OK, LOOKER_ERROR, REFUSED, INVALID = 0, 1, 2, 3
 WORKSPACE = {'dev': 'dev', 'prod': 'production'}
 
@@ -2667,8 +2670,8 @@ def cmd_init(proj, args):
         env_flag = args.env_file
         env_rel = os.path.relpath(os.path.abspath(env_flag), proj.root) if env_flag else '.env'
         proj.config = {'project': project, 'mode': mode, 'branch': branch if mode == 'dev' else None,
-                       'env_file': env_rel, 'include': args.include or DEFAULT_INCLUDE,
-                       'exclude': args.exclude or []}
+                       'env_file': env_rel, 'include': args.include or INIT_INCLUDE,
+                       'exclude': args.exclude or INIT_EXCLUDE}
         proj.save_config()
         out(f'wrote {os.path.relpath(proj.config_path, proj.root)}')
     ensure_gitignore(proj.root, [META_DIR + '/'])

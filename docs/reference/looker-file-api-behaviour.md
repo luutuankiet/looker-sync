@@ -124,3 +124,13 @@ The API has no conditional form of this call. A client that needs "only if empty
 files first, and a file created between that listing and the delete is destroyed. The older row
 in the table at the top of this page, which says 400, is what an earlier check saw; the `path`
 query parameter is what was sent here.
+
+## Which file types the write API takes
+
+verified: 2026-11-09, sandbox project, one try each, content `{"a": 1}` plus a newline.
+
+`POST /projects/{p}/files` answered 200, the file was listed, and the bytes read back matched for
+`.js`, `.md` and `.strings.json`. It answered 400, and the file was not listed, for `.json`,
+`.topojson`, `.geojson`, `.css`, `.html` and `.txt`. Looker's docs say the IDE takes JSON data
+files (`.json`, `.topojson`, `.geojson`), but this API call refused them. Keep a type out of
+`include` unless this call accepts it, or every write of it fails.

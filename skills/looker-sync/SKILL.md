@@ -65,8 +65,8 @@ to that user's dev workspace, which the developer never sees.
   it needs `--yes` plus `--local-changes push|backup|cancel` when local work is unpushed.
   Backups land in `.looker-sync/backups/<branch>-<timestamp>/`.
   In a linked folder (below) the backup is a `git stash` instead, and git moves too.
-- Only `*.lkml` and `*.dashboard.lookml` sync by default (`include`/`exclude` in the
-  config). `.env`, skills, editor settings and `.looker-sync/` never reach Looker.
+- A fresh `init` syncs `*.lkml`, `*.dashboard.lookml`, `*.js`, `*.md` and `*.strings.json`,
+  and skips `node_modules/` (`include`/`exclude` in the config). Other files never sync. `.env`, skills, editor settings and `.looker-sync/` never reach Looker.
 - The Looker MCP write tools are not an alternative: they run in production mode under a
   separate login and cannot see dev files. MCP read and query tools are fine.
 
